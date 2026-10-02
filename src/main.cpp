@@ -77,6 +77,19 @@ String myLevel = "WAITING", regionalLevel = "WAITING", station = "";
 String eventState = "normal";
 float stationLat = 0, stationLon = 0;
 bool stationLocationReady = false;
+float manualLat = 0, manualLon = 0;
+bool manualLatSet = false, manualLonSet = false, manualRadar = false;
+
+bool validCoordinate(const String &value, float limit, float &result) {
+  if (value.isEmpty()) return false;
+  char *end = nullptr;
+  double parsed = strtod(value.c_str(), &end);
+  if (end == value.c_str() || *end != '\0' || !isfinite(parsed) || parsed < -limit || parsed > limit)
+    return false;
+  result = static_cast<float>(parsed);
+  return true;
+}
+
 constexpr int MAX_AIRCRAFT = 32;
 struct Aircraft {
   char hex[9], flight[12];
@@ -86,6 +99,13 @@ struct Aircraft {
 Aircraft aircraft[MAX_AIRCRAFT], oldAircraft[MAX_AIRCRAFT];
 uint8_t aircraftCount = 0, oldAircraftCount = 0, radarRadiusNm = 50;
 String selectedAircraft, radarState = "WAITING";
+void resetRadarCenter() {
+  aircraftCount = 0;
+  oldAircraftCount = 0;
+  selectedAircraft = "";
+  radarState = "UPDATING";
+  nextRadar = millis();
+}
 constexpr int TREND_SAMPLES = 60;
 uint8_t myTrend[TREND_SAMPLES] = {}, regionalTrend[TREND_SAMPLES] = {};
 uint8_t trendCount = 0, trendNext = 0;
@@ -185,6 +205,9 @@ void saveSettings() {
   prefs.putBool("idlecycle", idleCycle);
   prefs.putUChar("daybl", normalBacklight);
   prefs.putUChar("nightbl", nightBacklight);
+  if (manualLatSet) prefs.putFloat("radlat", manualLat);
+  if (manualLonSet) prefs.putFloat("radlon", manualLon);
+  prefs.putBool("radmanual", manualRadar);
 }
 
 void ledColor(uint8_t r, uint8_t g, uint8_t b) {
@@ -490,7 +513,7 @@ void drawRadarPanel() {
     text(281, 222, a.altitude < 0 ? "Ground" : String(a.altitude) + " ft", WHITE);
     text(281, 243, String(a.speed) + " kt", MUTED);
   } else text(281, 174, "Tap an aircraft", MUTED);
-  text(281, 260, "Data: ADSB.lol", MUTED);
+  text(281, 260, manualRadar ? "ADSB.lol / MANUAL" : "ADSB.lol / PROPVIEW", MUTED);
 }
 
 void drawRadar() {
@@ -506,8 +529,9 @@ void updateRadar() {
 }
 
 void pollRadar() {
-  if (!stationLocationReady || WiFi.status() != WL_CONNECTED) {
-    radarState = stationLocationReady ? "WI-FI OFFLINE" : "NO LOCATION";
+  bool locationReady = manualRadar ? manualLatSet && manualLonSet : stationLocationReady;
+  if (!locationReady || WiFi.status() != WL_CONNECTED) {
+    radarState = locationReady ? "WI-FI OFFLINE" : "NO LOCATION";
     if (page == 2) drawRadarPanel();
     return;
   }
@@ -517,8 +541,9 @@ void pollRadar() {
   http.setTimeout(8000);
   http.setUserAgent("HamDesk-CYD/1.0");
   http.useHTTP10(true);
-  String url = "https://api.adsb.lol/v2/point/" + String(stationLat, 5) + "/" +
-               String(stationLon, 5) + "/" + String(radarRadiusNm);
+  String url = "https://api.adsb.lol/v2/point/" +
+               String(manualRadar ? manualLat : stationLat, 5) + "/" +
+               String(manualRadar ? manualLon : stationLon, 5) + "/" + String(radarRadiusNm);
   if (!http.begin(client, url)) { radarState = "FEED ERROR"; drawRadarPanel(); return; }
   int code = http.GET();
   if (code != 200) {
@@ -725,8 +750,8 @@ void drawSetup() {
   if (wifiScanView) { drawWifiScan(); return; }
   frame("SETTINGS");
   if (settingsView == 0) {
-    const char *items[] = {"WI-FI", "PROPVIEW", "HAMALERT", "CASE LIGHT", "ALERTS", "DEVICE", "DISPLAY"};
-    for (int i = 0; i < 7; ++i)
+    const char *items[] = {"WI-FI", "PROPVIEW", "HAMALERT", "CASE LIGHT", "ALERTS", "DEVICE", "DISPLAY", "RADAR"};
+    for (int i = 0; i < 8; ++i)
       button(22 + (i % 3) * 149, 51 + (i / 3) * 72, 137, 60, items[i]);
     return;
   }
@@ -782,6 +807,13 @@ void drawSetup() {
     button(22, 151, 204, 34, "CHANGE PASSWORD");
     button(240, 151, 216, 34, "CALIBRATE TOUCH");
     button(22, 201, 204, 39, "START SETUP AP");
+  } else if (settingsView == 9) {
+    text(115, 57, "RADAR CENTER", CYAN, 4);
+    settingRow(91, "Latitude (-90 to 90)", manualLatSet ? String(manualLat, 5) : "Not set");
+    settingRow(141, "Longitude (-180 to 180)", manualLonSet ? String(manualLon, 5) : "Not set");
+    button(22, 200, 204, 38, manualRadar ? "MANUAL: ACTIVE" : "USE MANUAL");
+    button(240, 200, 216, 38, manualRadar ? "USE PROPVIEW" : "PROPVIEW: ACTIVE");
+    text(22, 253, manualLatSet && manualLonSet ? "Wi-Fi required for aircraft feed" : "Enter both coordinates first", MUTED);
   } else if (settingsView == 8) {
     text(115, 57, "DISPLAY", CYAN, 4);
     const char *names[] = {"GREEN", "AMBER", "CYAN"};
@@ -820,8 +852,8 @@ void connectWifi();
 const char *fieldName(uint8_t field) {
   const char *names[] = {"", "Wi-Fi network", "Wi-Fi password", "PropView URL",
                          "HamAlert username", "HamAlert password", "HamAlert host", "HamAlert port",
-                         "Setup AP / web password"};
-  return field < 9 ? names[field] : "";
+                         "Setup AP / web password", "Radar latitude", "Radar longitude"};
+  return field < 11 ? names[field] : "";
 }
 
 const char *keyboardRow(int row) {
@@ -866,7 +898,7 @@ void drawKeyboard() {
 
 void startEditor(uint8_t field) {
   editField = field;
-  keyboardMode = 0;
+  keyboardMode = field == 9 || field == 10 ? 2 : 0;
   editorError = "";
   switch (field) {
     case 1: editValue = wifiSsid; break;
@@ -877,6 +909,8 @@ void startEditor(uint8_t field) {
     case 6: editValue = hamHost; break;
     case 7: editValue = String(hamPort); break;
     case 8: editValue = ""; break;
+    case 9: editValue = manualLatSet ? String(manualLat, 5) : ""; break;
+    case 10: editValue = manualLonSet ? String(manualLon, 5) : ""; break;
     default: editValue = "";
   }
   keyboardOpen = true;
@@ -887,6 +921,12 @@ void saveEditor() {
   if (editField != 1 && editField != 2 && editField != 5 && editField != 8) editValue.trim();
   if (editField == 8 && (editValue.length() < 8 || editValue.length() > 63)) {
     editorError = "Password must be 8-63 characters"; drawKeyboard(); return;
+  }
+  float coordinate = 0;
+  if ((editField == 9 || editField == 10) &&
+      !validCoordinate(editValue, editField == 9 ? 90 : 180, coordinate)) {
+    editorError = editField == 9 ? "Enter latitude -90 to 90" : "Enter longitude -180 to 180";
+    drawKeyboard(); return;
   }
   switch (editField) {
     case 1: wifiSsid = editValue; break;
@@ -903,6 +943,8 @@ void saveEditor() {
     case 6: hamHost = editValue; alertClient.stop(); break;
     case 7: hamPort = constrain(editValue.toInt(), 1, 65535); alertClient.stop(); break;
     case 8: setupPassword = editValue; break;
+    case 9: manualLat = coordinate; manualLatSet = true; if (manualRadar) resetRadarCenter(); break;
+    case 10: manualLon = coordinate; manualLonSet = true; if (manualRadar) resetRadarCenter(); break;
   }
   saveSettings();
   keyboardOpen = false;
@@ -937,7 +979,7 @@ void handleSettingsTouch(uint16_t x, uint16_t y) {
     if (y >= 51 && y < 255 && x >= 22 && x < 457) {
       int col = (x - 22) / 149, row = (y - 51) / 72;
       int choice = row * 3 + col;
-      if (choice < 7) { settingsView = choice == 6 ? 8 : choice + 1; drawSetup(); }
+      if (choice < 8) { settingsView = choice == 6 ? 8 : choice == 7 ? 9 : choice + 1; drawSetup(); }
     }
     return;
   }
@@ -986,6 +1028,14 @@ void handleSettingsTouch(uint16_t x, uint16_t y) {
     if (y >= 151 && y < 186 && x < 230) startEditor(8);
     else if (y >= 151 && y < 186 && x >= 240) { prefs.putBool("calnext", true); ESP.restart(); }
     else if (y >= 201 && y < 241) startAp();
+  } else if (settingsView == 9) {
+    if (y >= 91 && y < 135) startEditor(9);
+    else if (y >= 141 && y < 185) startEditor(10);
+    else if (y >= 200 && y < 239 && x >= 22 && x < 226 && manualLatSet && manualLonSet) {
+      manualRadar = true; resetRadarCenter(); saveSettings(); drawSetup();
+    } else if (y >= 200 && y < 239 && x >= 240 && x < 456) {
+      manualRadar = false; resetRadarCenter(); saveSettings(); drawSetup();
+    }
   } else if (settingsView == 8) {
     if (y >= 94 && y < 133 && x < 459) theme = min(static_cast<int>((x - 22) / 149), 2);
     else if (y >= 144 && y < 182 && x < 230) { nightMode = !nightMode; autoNight = false; }
@@ -1186,6 +1236,12 @@ void setupWeb() {
     s += "Wi-Fi password<input name='wifi' type='password' placeholder='Leave blank to keep current'>";
     s += "Setup AP / web password<input name='setup' type='password' minlength='8' maxlength='63' placeholder='Leave blank to keep current'>";
     s += "PropView URL<input name='prop' value='" + htmlEscape(propUrl) + "' placeholder='http://192.168.1.20:8000'>";
+    s += "<h2>Radar center</h2>Latitude<input name='radlat' type='number' step='any' min='-90' max='90' value='" +
+         String(manualLatSet ? String(manualLat, 5) : "") + "'>";
+    s += "Longitude<input name='radlon' type='number' step='any' min='-180' max='180' value='" +
+         String(manualLonSet ? String(manualLon, 5) : "") + "'>";
+    s += "Center source<select name='radsource'><option value='prop'" + String(!manualRadar ? " selected" : "") +
+         ">PropView</option><option value='manual'" + String(manualRadar ? " selected" : "") + ">Manual coordinates</option></select>";
     s += "HamAlert Telnet user<input name='hamuser' value='" + htmlEscape(hamUser) + "'>";
     s += "HamAlert Telnet password<input name='hampass' type='password' placeholder='Leave blank to keep current'>";
     s += "HamAlert host<input name='hamhost' value='" + htmlEscape(hamHost) + "'>";
@@ -1211,6 +1267,18 @@ void setupWeb() {
     if (requestedPassword.length() && (requestedPassword.length() < 8 || requestedPassword.length() > 63)) {
       web.send(400, "text/plain", "Setup password must be 8-63 characters."); return;
     }
+    String latitude = web.arg("radlat"), longitude = web.arg("radlon");
+    latitude.trim(); longitude.trim();
+    float newLat = 0, newLon = 0;
+    bool hasLat = validCoordinate(latitude, 90, newLat);
+    bool hasLon = validCoordinate(longitude, 180, newLon);
+    if ((!latitude.isEmpty() && !hasLat) || (!longitude.isEmpty() && !hasLon) ||
+        (web.arg("radsource") == "manual" && (!hasLat || !hasLon))) {
+      web.send(400, "text/plain", "Enter valid radar latitude and longitude before using manual center."); return;
+    }
+    if (hasLat) { manualLat = newLat; manualLatSet = true; }
+    if (hasLon) { manualLon = newLon; manualLonSet = true; }
+    manualRadar = web.arg("radsource") == "manual";
     if (requestedPassword.length()) setupPassword = requestedPassword;
     wifiSsid = web.arg("ssid"); wifiSsid.trim();
     if (web.arg("wifi").length()) wifiPassword = web.arg("wifi");
@@ -1510,6 +1578,11 @@ void setup() {
   applyTheme();
   radarRadiusNm = prefs.getUChar("radarrad", 50);
   if (radarRadiusNm != 25 && radarRadiusNm != 50 && radarRadiusNm != 100) radarRadiusNm = 50;
+  manualLatSet = prefs.isKey("radlat"); manualLonSet = prefs.isKey("radlon");
+  manualLat = prefs.getFloat("radlat", 0); manualLon = prefs.getFloat("radlon", 0);
+  manualLatSet = manualLatSet && isfinite(manualLat) && fabsf(manualLat) <= 90;
+  manualLonSet = manualLonSet && isfinite(manualLon) && fabsf(manualLon) <= 180;
+  manualRadar = prefs.getBool("radmanual", false) && manualLatSet && manualLonSet;
   tft.init(); tft.setRotation(1); tft.setTextDatum(TL_DATUM);
   radarCanvas.setColorDepth(8);
   radarCanvasReady = radarCanvas.createSprite(RADAR_W, RADAR_H) != nullptr;
