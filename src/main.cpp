@@ -41,7 +41,7 @@ uint8_t scanCount = 0;
 bool wifiScanView = false, scanSelectionPending = false;
 bool scanInProgress = false, scanPressLocked = false;
 bool scanFailed = false;
-uint32_t scanReleaseSince = 0;
+uint32_t scanStartedAt = 0;
 struct Rgb { uint8_t r, g, b; };
 // This particular board's red LED channel remains dark even with GPIO4 driven
 // low directly. Match the on-screen choices to the working green/blue channels.
@@ -661,10 +661,10 @@ void drawWifiScan() {
 void scanWifi() {
   if (scanInProgress || scanPressLocked) return;
   scanPressLocked = true;
-  scanReleaseSince = 0;
   wifiScanView = true;
   scanCount = 0;
   scanInProgress = true;
+  scanStartedAt = millis();
   scanFailed = false;
   drawWifiScan();
   if (apMode) WiFi.mode(WIFI_AP_STA);
@@ -679,7 +679,11 @@ void scanWifi() {
 void finishWifiScan() {
   if (!scanInProgress) return;
   int found = WiFi.scanComplete();
-  if (found == WIFI_SCAN_RUNNING) return;
+  if (found == WIFI_SCAN_RUNNING) {
+    if (millis() - scanStartedAt < 8000) return;
+    found = WIFI_SCAN_FAILED;
+    Serial.println("Wi-Fi scan timed out");
+  }
   scanInProgress = false;
   scanFailed = found == WIFI_SCAN_FAILED;
   if (found > 0) {
@@ -1427,14 +1431,7 @@ void handleTouch() {
     if (z > 25) Serial.printf("Touch pressure=%u\n", z);
   }
   uint16_t x, y;
-  if (!getTouch(x, y)) {
-    if (scanPressLocked) {
-      if (!scanReleaseSince) scanReleaseSince = millis();
-      else if (millis() - scanReleaseSince >= 150) scanPressLocked = false;
-    }
-    return;
-  }
-  scanReleaseSince = 0;
+  if (!getTouch(x, y)) { scanPressLocked = false; return; }
   if (millis() - touchTime < 250) return;
   touchTime = millis();
   lastInteraction = millis();
@@ -1570,19 +1567,19 @@ void loop() {
     bootHold = 0;
     bootLong = false;
   }
-  if (!apMode && !wifiConnecting && !keyboardOpen && !scanSelectionPending &&
+  if (!apMode && page != 4 && !wifiConnecting && !keyboardOpen && !scanSelectionPending &&
       !scanInProgress && !wifiScanView && WiFi.status() != WL_CONNECTED) {
     if (static_cast<int32_t>(millis() - nextWifiRetry) >= 0) {
       nextWifiRetry = millis() + 30000;
       connectWifi(); draw();
     }
   }
-  if (!apMode && !keyboardOpen && !scanInProgress && !wifiScanView &&
+  if (!apMode && page != 4 && !keyboardOpen && !scanInProgress && !wifiScanView &&
       static_cast<int32_t>(millis() - nextProp) >= 0) {
     nextProp = millis() + 15000;
     pollProp();
   }
-  if (!apMode && !keyboardOpen && !scanInProgress && !wifiScanView) pollHamAlert();
+  if (!apMode && page != 4 && !keyboardOpen && !scanInProgress && !wifiScanView) pollHamAlert();
   if (!apMode && page == 2 && !spotlightOpen && static_cast<int32_t>(millis() - nextRadar) >= 0) {
     nextRadar = millis() + 30000;
     pollRadar();
