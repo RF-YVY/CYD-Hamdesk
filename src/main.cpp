@@ -34,16 +34,14 @@ String hamUser, hamPassword, hamHost;
 uint16_t hamPort = 7300;
 bool lampEnabled = true, apMode = false, gt911 = false, touchReady = false;
 uint8_t lampPercent = 25;
-bool batterySenseEnabled = false;
-float batteryDivider = 2.0f;
-uint32_t lastBatteryRead = 0;
-int batteryMilliVolts = 0, batteryPercent = -1;
 String scanSsids[5];
 int32_t scanRssi[5] = {};
 bool scanSecured[5] = {};
 uint8_t scanCount = 0;
 bool wifiScanView = false, scanSelectionPending = false;
-bool scanInProgress = false;
+bool scanInProgress = false, scanPressLocked = false;
+bool scanFailed = false;
+uint32_t scanReleaseSince = 0;
 struct Rgb { uint8_t r, g, b; };
 // This particular board's red LED channel remains dark even with GPIO4 driven
 // low directly. Match the on-screen choices to the working green/blue channels.
@@ -62,6 +60,7 @@ String editValue;
 String editorError;
 bool keyboardOpen = false;
 uint32_t nextProp = 0, nextAlertConnect = 0;
+uint32_t nextWifiRetry = 0;
 uint32_t lastPropSuccess = 0;
 uint32_t lastHealthRefresh = 0;
 uint32_t nextRadar = 0, lastRadarSuccess = 0;
@@ -172,8 +171,6 @@ void saveSettings() {
   prefs.putUShort("hamport", hamPort);
   prefs.putBool("lamp", lampEnabled);
   prefs.putUChar("lampPct", lampPercent);
-  prefs.putBool("batsense", batterySenseEnabled);
-  prefs.putFloat("batdiv", batteryDivider);
   prefs.putBytes("tabcolor", tabColor, sizeof(tabColor));
   prefs.putBool("propalert", propAlerts);
   prefs.putBool("spotalert", spotAlerts);
@@ -299,18 +296,11 @@ void drawExpandedTrend() {
   text(23, 249, "PEAK " + String(peakMy) + " / " + String(peakRegion) + "   AMBER: OPENING", WHITE);
 }
 
-void drawBatteryBadge() {
-  tft.fillRect(187, 8, 100, 25, PANEL);
-  tft.setTextColor(batteryPercent >= 0 ? GREEN : MUTED, PANEL);
-  tft.drawString(batteryPercent >= 0 ? "BAT " + String(batteryPercent) + "%" : "BAT --", 192, 14, 2);
-}
-
 void frame(const String &title) {
   tft.fillScreen(BG);
   tft.fillRect(0, 0, W, 41, PANEL);
   tft.setTextColor(WHITE, PANEL);
   tft.drawString("HAM DESK", 13, 9, 4);
-  drawBatteryBadge();
   tft.drawRightString(title, 465, 13, 2);
   tft.fillRect(0, 277, W, 43, PANEL);
   const char *tabs[] = {"PROP", "SPOTS", "RADAR", "HEALTH", "SETUP"};
@@ -628,17 +618,6 @@ void drawSpotlight() {
   text(24, 248, "TAP TO OPEN  |  AUTO CLOSES", AMBER);
 }
 
-void updateBattery() {
-  if (!batterySenseEnabled || millis() - lastBatteryRead < 15000) return;
-  uint32_t sum = 0;
-  for (int i = 0; i < 8; ++i) sum += analogReadMilliVolts(35);
-  batteryMilliVolts = static_cast<int>(sum / 8 * batteryDivider);
-  batteryPercent = batteryMilliVolts < 3000 || batteryMilliVolts > 4350 ? -1 :
-                   constrain((batteryMilliVolts - 3300) * 100 / 900, 0, 100);
-  lastBatteryRead = millis();
-  if (!keyboardOpen && !spotlightOpen) drawBatteryBadge();
-}
-
 void refreshHealth() {
   bool wifiOk = WiFi.status() == WL_CONNECTED;
   bool propOk = wifiOk && propLive && lastPropSuccess && millis() - lastPropSuccess < 30000;
@@ -650,10 +629,6 @@ void refreshHealth() {
   updateText(180, 160, 278, 22, lastPropSuccess ? String((millis() - lastPropSuccess) / 1000) + " sec ago" : "Never", WHITE);
   updateText(180, 194, 278, 22, hamUser.isEmpty() ? "NOT SET" : alertClient.connected() ? "CONNECTED" : "WAITING",
        alertClient.connected() ? GREEN : AMBER);
-  updateText(180, 227, 278, 30,
-             !batterySenseEnabled ? "SENSOR NOT WIRED" : batteryPercent < 0 ? "NO VALID READING" :
-             String(batteryPercent) + "%  " + String(batteryMilliVolts / 1000.0f, 2) + " V",
-             batteryPercent >= 0 ? GREEN : AMBER, 2);
   lastHealthRefresh = millis();
 }
 
@@ -664,7 +639,6 @@ void drawHealth() {
   text(22, 124, "PROPVIEW", MUTED);
   text(22, 160, "LAST GOOD", MUTED);
   text(22, 194, "HAMALERT", MUTED);
-  text(22, 227, "BATTERY", MUTED);
   refreshHealth();
 }
 
@@ -673,7 +647,8 @@ void drawWifiScan() {
   button(22, 51, 74, 32, "BACK");
   button(300, 51, 156, 32, "SCAN AGAIN", CYAN, BG);
   if (!scanCount) text(22, 105, scanInProgress ? "Scanning nearby networks..." :
-                       "No networks found. Try scanning again.", scanInProgress ? CYAN : AMBER);
+                       scanFailed ? "Scan failed. Tap SCAN AGAIN." :
+                       "No networks found. Tap SCAN AGAIN.", scanInProgress ? CYAN : AMBER);
   for (int i = 0; i < scanCount; ++i) {
     int y = 91 + i * 36;
     button(22, y, 434, 32, scanSsids[i].substring(0, 25) +
@@ -682,12 +657,29 @@ void drawWifiScan() {
 }
 
 void scanWifi() {
+  if (scanInProgress) return;
+  scanPressLocked = true;
+  scanReleaseSince = 0;
   wifiScanView = true;
   scanCount = 0;
   scanInProgress = true;
+  scanFailed = false;
   drawWifiScan();
   if (apMode) WiFi.mode(WIFI_AP_STA);
-  int found = WiFi.scanNetworks(false, false);
+  WiFi.scanDelete();
+  int started = WiFi.scanNetworks(true, false, false, 120);
+  if (started == WIFI_SCAN_FAILED) {
+    scanInProgress = false; scanFailed = true; drawWifiScan();
+    Serial.println("Wi-Fi scan failed to start");
+  } else Serial.println("Wi-Fi scan started");
+}
+
+void finishWifiScan() {
+  if (!scanInProgress) return;
+  int found = WiFi.scanComplete();
+  if (found == WIFI_SCAN_RUNNING) return;
+  scanInProgress = false;
+  scanFailed = found == WIFI_SCAN_FAILED;
   if (found > 0) {
     for (int i = 0; i < found && scanCount < 5; ++i) {
       String ssid = WiFi.SSID(i);
@@ -702,8 +694,12 @@ void scanWifi() {
     }
   }
   WiFi.scanDelete();
-  scanInProgress = false;
-  drawWifiScan();
+  Serial.printf("Wi-Fi scan finished: %u networks shown\n", scanCount);
+  if (!apMode && WiFi.status() != WL_CONNECTED) {
+    WiFi.reconnect();
+    nextWifiRetry = millis() + 30000;
+  }
+  if (page == 4 && wifiScanView && !keyboardOpen) drawWifiScan();
 }
 
 void button(int x, int y, int w, int h, const String &label, uint16_t fill,
@@ -1176,8 +1172,6 @@ void setupWeb() {
     for (int i = 0; i <= 100; i += 25)
       s += "<option value='" + String(i) + "'" + (lampPercent == i ? " selected" : "") + ">" + String(i) + "%</option>";
     s += "</select>";
-    s += "<label><input name='batsense' type='checkbox' style='width:auto' " + String(batterySenseEnabled ? "checked" : "") + "> Battery voltage sensor on GPIO35 (requires external divider)</label>";
-    s += "Battery divider ratio<input name='batdiv' type='number' min='1.1' max='10' step='0.01' value='" + String(batteryDivider, 2) + "'>";
     s += "<label><input name='lamp' type='checkbox' style='width:auto' " + String(lampEnabled ? "checked" : "") + "> Enable case light</label><p><button>Save and restart</button></form>";
     s.replace("<p><button>Save and restart</button></form>",
       "<p>Opening score threshold (0-100)<input name='openscore' type='number' min='0' max='100' value='" + String(openingScore) + "'>"
@@ -1206,8 +1200,6 @@ void setupWeb() {
     hamPort = constrain(web.arg("hamport").toInt(), 1, 65535);
     lampPercent = constrain(web.arg("level").toInt() / 25 * 25, 0, 100);
     lampEnabled = web.hasArg("lamp");
-    batterySenseEnabled = web.hasArg("batsense");
-    batteryDivider = constrain(web.arg("batdiv").toFloat(), 1.1f, 10.0f);
     openingScore = constrain(web.arg("openscore").toInt(), 0, 100);
     propAlerts = web.hasArg("propalert");
     spotAlerts = web.hasArg("spotalert");
@@ -1417,7 +1409,15 @@ void handleTouch() {
     if (z > 25) Serial.printf("Touch pressure=%u\n", z);
   }
   uint16_t x, y;
-  if (!getTouch(x, y) || millis() - touchTime < 250) return;
+  if (!getTouch(x, y)) {
+    if (scanPressLocked) {
+      if (!scanReleaseSince) scanReleaseSince = millis();
+      else if (millis() - scanReleaseSince >= 150) scanPressLocked = false;
+    }
+    return;
+  }
+  scanReleaseSince = 0;
+  if (scanPressLocked || millis() - touchTime < 250) return;
   touchTime = millis();
   lastInteraction = millis();
   if (spotlightOpen) {
@@ -1471,11 +1471,6 @@ void setup() {
     uint8_t oldLevel = prefs.getUChar("level", 14);
     lampPercent = constrain(((static_cast<int>(oldLevel) * 100 / 80 + 12) / 25) * 25, 0, 100);
   }
-  batterySenseEnabled = prefs.getBool("batsense", false);
-  batteryDivider = prefs.getFloat("batdiv", 2.0f);
-  if (batteryDivider < 1.1f || batteryDivider > 10.0f) batteryDivider = 2.0f;
-  if (batterySenseEnabled) analogSetPinAttenuation(35, ADC_11db);
-  lastBatteryRead = millis() - 15000;
   if (prefs.getBytesLength("tabcolor") == sizeof(tabColor))
     prefs.getBytes("tabcolor", tabColor, sizeof(tabColor));
   else if (prefs.getBytesLength("tabcolor") == 4) {
@@ -1512,6 +1507,7 @@ void setup() {
   setupWeb();
   draw();
   nextProp = millis() + 1000;
+  nextWifiRetry = millis() + 30000;
   nextAlertConnect = millis() + 1000;
   lastInteraction = millis();
   Serial.println("Ham Desk ready");
@@ -1520,7 +1516,7 @@ void setup() {
 void loop() {
   web.handleClient();
   handleTouch();
-  updateBattery();
+  finishWifiScan();
   bool wasNight = nightMode;
   updateNightSchedule();
   if (nightMode != wasNight) draw();
@@ -1555,14 +1551,17 @@ void loop() {
     bootHold = 0;
     bootLong = false;
   }
-  if (!apMode && WiFi.status() != WL_CONNECTED) {
-    if (millis() - nextProp > 30000) { nextProp = millis(); connectWifi(); draw(); }
+  if (!apMode && !scanInProgress && !wifiScanView && WiFi.status() != WL_CONNECTED) {
+    if (static_cast<int32_t>(millis() - nextWifiRetry) >= 0) {
+      nextWifiRetry = millis() + 30000;
+      connectWifi(); draw();
+    }
   }
-  if (!apMode && static_cast<int32_t>(millis() - nextProp) >= 0) {
+  if (!apMode && !scanInProgress && !wifiScanView && static_cast<int32_t>(millis() - nextProp) >= 0) {
     nextProp = millis() + 15000;
     pollProp();
   }
-  if (!apMode) pollHamAlert();
+  if (!apMode && !scanInProgress && !wifiScanView) pollHamAlert();
   if (!apMode && page == 2 && !spotlightOpen && static_cast<int32_t>(millis() - nextRadar) >= 0) {
     nextRadar = millis() + 30000;
     pollRadar();
