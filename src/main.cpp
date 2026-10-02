@@ -12,9 +12,16 @@
 namespace {
 constexpr int W = 480, H = 320;
 constexpr int BL = 27, LED_R = 4, LED_G = 16, LED_B = 17, BOOT = 0;
-constexpr uint16_t BG = 0x0843, PANEL = 0x10A5, WHITE = 0xEF7D;
-constexpr uint16_t MUTED = 0x8C71, CYAN = 0x45FA, AMBER = 0xFCA1;
-constexpr uint16_t GREEN = 0x67EC, RED = 0xFA69;
+uint16_t BG = 0x0843, PANEL = 0x10A5, WHITE = 0xEF7D;
+uint16_t MUTED = 0x8C71, CYAN = 0x45FA, AMBER = 0xFCA1;
+uint16_t GREEN = 0x67EC, RED = 0xFA69;
+uint8_t theme = 2;
+bool nightMode = false, autoNight = false, idleCycle = false;
+int8_t utcOffset = 0;
+uint8_t normalBacklight = 255, nightBacklight = 35;
+uint32_t lastInteraction = 0, lastIdlePage = 0, spotlightUntil = 0;
+bool spotlightOpen = false, trendExpanded = false, idleActive = false;
+uint8_t idlePage = 0;
 TFT_eSPI tft;
 TFT_eSprite radarCanvas(&tft);
 constexpr int RADAR_X = 25, RADAR_Y = 42, RADAR_W = 244, RADAR_H = 230;
@@ -70,6 +77,7 @@ String selectedAircraft, radarState = "WAITING";
 constexpr int TREND_SAMPLES = 60;
 uint8_t myTrend[TREND_SAMPLES] = {}, regionalTrend[TREND_SAMPLES] = {};
 uint8_t trendCount = 0, trendNext = 0;
+uint8_t openingTrend[TREND_SAMPLES] = {};
 struct PropSnapshot {
   bool live, rf, aprs;
   float myScore, regionalScore;
@@ -85,6 +93,10 @@ Spot spots[5];
 uint8_t spotCount = 0;
 int8_t selectedSpot = -1;
 bool unreadSpot = false;
+struct TrailPoint { float distance, bearing; uint32_t when; };
+TrailPoint trails[MAX_AIRCRAFT][4] = {};
+char trailHex[MAX_AIRCRAFT][9] = {};
+uint8_t trailCount[MAX_AIRCRAFT] = {};
 struct MeshEvent { String from, text, type, signal; };
 MeshEvent meshEvents[5];
 uint8_t meshCount = 0;
@@ -110,6 +122,34 @@ String randomHex(size_t chars) {
   return value;
 }
 
+void applyTheme() {
+  // Classic green, amber terminal, and cyan instrument presets.
+  if (theme == 0) {
+    BG = 0x0020; PANEL = 0x0840; WHITE = 0xCFF7; MUTED = 0x5A4A;
+    CYAN = 0x47E8; GREEN = 0x67E8; AMBER = 0xCF40; RED = 0xF9C7;
+  } else if (theme == 1) {
+    BG = 0x1000; PANEL = 0x20A0; WHITE = 0xFF37; MUTED = 0x9B25;
+    CYAN = 0xFD20; GREEN = 0xD5E0; AMBER = 0xFE20; RED = 0xF9C7;
+  } else {
+    BG = 0x0843; PANEL = 0x10A5; WHITE = 0xEF7D; MUTED = 0x8C71;
+    CYAN = 0x45FA; GREEN = 0x67EC; AMBER = 0xFCA1; RED = 0xFA69;
+  }
+  if (nightMode) {
+    BG = 0x0000; PANEL = 0x0800;
+    MUTED = 0x528A;
+  }
+  ledcWrite(3, nightMode ? nightBacklight : normalBacklight);
+}
+
+void updateNightSchedule() {
+  if (!autoNight) return;
+  time_t now = time(nullptr);
+  if (now < 1600000000) return;
+  int hour = ((now / 3600 + utcOffset) % 24 + 24) % 24;
+  bool shouldDim = hour >= 22 || hour < 6;
+  if (shouldDim != nightMode) { nightMode = shouldDim; applyTheme(); }
+}
+
 void saveSettings() {
   prefs.putString("ssid", wifiSsid);
   prefs.putString("wifi", wifiPassword);
@@ -125,6 +165,13 @@ void saveSettings() {
   prefs.putBool("spotalert", spotAlerts);
   prefs.putBool("meshalert", meshAlerts);
   prefs.putUChar("openscore", openingScore);
+  prefs.putUChar("theme", theme);
+  prefs.putBool("night", nightMode);
+  prefs.putBool("autonight", autoNight);
+  prefs.putChar("utcoffset", utcOffset);
+  prefs.putBool("idlecycle", idleCycle);
+  prefs.putUChar("daybl", normalBacklight);
+  prefs.putUChar("nightbl", nightBacklight);
 }
 
 void ledColor(uint8_t r, uint8_t g, uint8_t b) {
@@ -196,16 +243,18 @@ void bar(int x, int y, int width, float score, uint16_t color) {
 
 void button(int x, int y, int w, int h, const String &label,
             uint16_t fill = PANEL, uint16_t ink = WHITE);
+void frame(const String &title);
 
 void recordTrend() {
   myTrend[trendNext] = constrain(static_cast<int>(roundf(myScore)), 0, 100);
   regionalTrend[trendNext] = constrain(static_cast<int>(roundf(regionalScore)), 0, 100);
+  openingTrend[trendNext] = opening ? 1 : 0;
   trendNext = (trendNext + 1) % TREND_SAMPLES;
   if (trendCount < TREND_SAMPLES) ++trendCount;
 }
 
 void drawTrend() {
-  constexpr int x = 23, y = 196, w = 432, h = 47;
+  const int x = 23, y = trendExpanded ? 73 : 196, w = 432, h = trendExpanded ? 169 : 47;
   tft.fillRect(x, y, w, h, BG);
   tft.drawFastHLine(x, y + h - 1, w, 0x2948);
   tft.drawFastHLine(x, y + h / 2, w, 0x2948);
@@ -220,7 +269,20 @@ void drawTrend() {
                  xb, y + h - 1 - myTrend[b] * (h - 2) / 100, CYAN);
     tft.drawLine(xa, y + h - 1 - regionalTrend[a] * (h - 2) / 100,
                  xb, y + h - 1 - regionalTrend[b] * (h - 2) / 100, GREEN);
+    if (openingTrend[b]) tft.drawFastVLine(xb, y + h - 9, 9, AMBER);
   }
+}
+
+void drawExpandedTrend() {
+  frame("PROPAGATION HISTORY");
+  text(23, 47, "15 MINUTES  |  CYAN: MY  GREEN: REGION", MUTED);
+  drawTrend();
+  int peakMy = 0, peakRegion = 0;
+  for (int i = 0; i < trendCount; ++i) {
+    peakMy = max(peakMy, static_cast<int>(myTrend[i]));
+    peakRegion = max(peakRegion, static_cast<int>(regionalTrend[i]));
+  }
+  text(23, 249, "PEAK " + String(peakMy) + " / " + String(peakRegion) + "   AMBER: OPENING", WHITE);
 }
 
 void frame(const String &title) {
@@ -241,6 +303,7 @@ void frame(const String &title) {
 }
 
 void drawProp() {
+  if (trendExpanded) { drawExpandedTrend(); return; }
   frame("APRS PROPVIEW");
   if (propUrl.isEmpty()) {
     text(24, 75, "Set PropView URL in SETUP", AMBER, 4);
@@ -264,7 +327,7 @@ void drawProp() {
   text(22, 165, "RF " + String(rfConnected ? "LIVE" : "OFF"), rfConnected ? GREEN : RED);
   text(145, 165, "IS " + String(aprsConnected ? "LIVE" : "OFF"), aprsConnected ? GREEN : RED);
   text(255, 165, eventState == "normal" ? "15 MIN TREND" : "OPENING " + eventState, eventState == "normal" ? MUTED : AMBER);
-  drawTrend();
+  if (!trendExpanded) drawTrend();
   text(22, 250, station + "  " + String(trendCount * 15 / 60) + "m history", MUTED);
 }
 
@@ -287,6 +350,7 @@ void updatePropChanged(const PropSnapshot &before) {
     updateText(22, 165, 115, 20, "RF " + String(rfConnected ? "LIVE" : "OFF"), rfConnected ? GREEN : RED);
   if (before.aprs != aprsConnected)
     updateText(145, 165, 105, 20, "IS " + String(aprsConnected ? "LIVE" : "OFF"), aprsConnected ? GREEN : RED);
+  if (trendExpanded) { drawExpandedTrend(); return; }
   drawTrend();
   updateText(22, 250, 220, 20, station + "  " + String(trendCount * 15 / 60) + "m history", MUTED);
   if (before.eventState != eventState)
@@ -326,6 +390,43 @@ void drawRadarGrid() {
   radarCanvas.drawString("W", 2, 111, 2);
 }
 
+int trailSlot(const char *hex) {
+  for (int i = 0; i < MAX_AIRCRAFT; ++i)
+    if (trailHex[i][0] && strcmp(trailHex[i], hex) == 0) return i;
+  int slot = 0;
+  for (int i = 1; i < MAX_AIRCRAFT; ++i)
+    if (!trailHex[i][0] || trails[i][0].when < trails[slot][0].when) slot = i;
+  snprintf(trailHex[slot], sizeof(trailHex[slot]), "%s", hex);
+  trailCount[slot] = 0;
+  return slot;
+}
+
+void recordAircraftTrails() {
+  for (int i = 0; i < aircraftCount; ++i) {
+    int slot = trailSlot(aircraft[i].hex);
+    for (int n = 3; n > 0; --n) trails[slot][n] = trails[slot][n - 1];
+    trails[slot][0] = {aircraft[i].distance, aircraft[i].bearing, millis()};
+    trailCount[slot] = min(static_cast<int>(trailCount[slot]) + 1, 4);
+  }
+}
+
+void drawRadarTrails() {
+  for (int i = 0; i < aircraftCount; ++i) {
+    int slot = trailSlot(aircraft[i].hex);
+    for (int n = trailCount[slot] - 1; n > 0; --n) {
+      TrailPoint a = trails[slot][n], b = trails[slot][n - 1];
+      if (millis() - a.when > 180000) continue;
+      Aircraft first = aircraft[i], second = first;
+      first.distance = a.distance; first.bearing = a.bearing; first.track = -1;
+      second.distance = b.distance; second.bearing = b.bearing; second.track = -1;
+      int x1, y1, x2, y2;
+      if (aircraftPoint(first, x1, y1) && aircraftPoint(second, x2, y2))
+        radarCanvas.drawLine(x1 - RADAR_X, y1 - RADAR_Y, x2 - RADAR_X, y2 - RADAR_Y,
+                             n >= 2 ? MUTED : (aircraft[i].altitude >= 10000 ? CYAN : GREEN));
+    }
+  }
+}
+
 void drawRadarMarks() {
   for (int i = 0; i < aircraftCount; ++i) {
     int x, y;
@@ -353,6 +454,7 @@ void drawRadarCanvas() {
   if (!radarCanvasReady) return;
   radarCanvas.fillSprite(BG);
   drawRadarGrid();
+  drawRadarTrails();
   drawRadarSweep();
   drawRadarMarks();
   radarCanvas.pushSprite(RADAR_X, RADAR_Y);
@@ -385,7 +487,7 @@ void drawRadar() {
 }
 
 void updateRadar() {
-  if (page != 2) return;
+  if (page != 2 || spotlightOpen) return;
   drawRadarCanvas();
   drawRadarPanel();
 }
@@ -453,6 +555,7 @@ void pollRadar() {
   }
   radarState = "LIVE";
   lastRadarSuccess = millis();
+  recordAircraftTrails();
   updateRadar();
   Serial.printf("Radar: %u aircraft, free heap %u\n", aircraftCount, ESP.getFreeHeap());
 }
@@ -488,6 +591,20 @@ void drawSpots() {
     text(393, y + 6, spots[i].spotTime.substring(0, 5), MUTED);
     tft.drawFastHLine(22, y + 31, 436, 0x2948);
   }
+}
+
+void drawSpotlight() {
+  if (!spotCount) return;
+  const Spot &s = spots[0];
+  tft.fillScreen(BG);
+  tft.fillRect(0, 0, W, 42, PANEL);
+  tft.setTextColor(AMBER, PANEL);
+  tft.drawString("NEW HAMALERT SPOT", 18, 10, 4);
+  text(24, 64, s.call.substring(0, 18), WHITE, 4);
+  text(24, 115, (s.freq + "  " + s.mode).substring(0, 30), CYAN, 4);
+  text(24, 163, s.location.substring(0, 50), WHITE);
+  text(24, 191, s.comment.substring(0, 52), MUTED);
+  text(24, 248, "TAP TO OPEN  |  AUTO CLOSES", AMBER);
 }
 
 void refreshHealth() {
@@ -531,10 +648,9 @@ void settingRow(int y, const String &label, const String &value) {
 void drawSetup() {
   frame("SETTINGS");
   if (settingsView == 0) {
-    const char *items[] = {"WI-FI", "PROPVIEW", "HAMALERT", "CASE LIGHT", "ALERTS", "DEVICE"};
-    for (int i = 0; i < 6; ++i)
-      button(22 + (i % 3) * 149, 63 + (i / 3) * 91, 137, 72, items[i]);
-    text(22, 251, "Tap a category to edit on this screen", MUTED);
+    const char *items[] = {"WI-FI", "PROPVIEW", "HAMALERT", "CASE LIGHT", "ALERTS", "DEVICE", "DISPLAY"};
+    for (int i = 0; i < 7; ++i)
+      button(22 + (i % 3) * 149, 51 + (i / 3) * 72, 137, 60, items[i]);
     return;
   }
   button(22, 51, 74, 32, "BACK");
@@ -586,6 +702,19 @@ void drawSetup() {
     text(22, 124, "Web password: " + setupPassword, MUTED);
     button(22, 147, 204, 39, "CALIBRATE TOUCH");
     button(22, 201, 204, 39, "START SETUP AP");
+  } else if (settingsView == 8) {
+    text(115, 57, "DISPLAY", CYAN, 4);
+    const char *names[] = {"GREEN", "AMBER", "CYAN"};
+    for (int i = 0; i < 3; ++i)
+      button(22 + i * 149, 94, 137, 38, names[i], theme == i ? CYAN : PANEL,
+             theme == i ? BG : WHITE);
+    button(22, 144, 208, 37, nightMode ? "NIGHT: ON" : "NIGHT: OFF");
+    button(248, 144, 208, 37, autoNight ? "22-06: AUTO" : "AUTO: OFF");
+    button(22, 191, 208, 37, idleCycle ? "IDLE CYCLE: ON" : "IDLE CYCLE: OFF");
+    text(248, 192, "UTC OFFSET " + String(utcOffset), WHITE);
+    button(248, 216, 60, 34, "-"); button(322, 216, 60, 34, "+");
+    text(22, 251, "Night dim: " + String(nightBacklight) + "/255", MUTED);
+    button(248, 250, 60, 26, "DIM-"); button(322, 250, 60, 26, "DIM+");
   } else {
     text(115, 57, "LED CHANNEL TEST", CYAN, 4);
     text(22, 99, "Tap one channel and check the rear LED", MUTED);
@@ -597,6 +726,7 @@ void drawSetup() {
 }
 
 void draw() {
+  if (spotlightOpen) { drawSpotlight(); return; }
   if (page == 0) drawProp();
   else if (page == 1) drawSpots();
   else if (page == 2) drawRadar();
@@ -690,10 +820,10 @@ void saveEditor() {
 
 void handleSettingsTouch(uint16_t x, uint16_t y) {
   if (settingsView == 0) {
-    if (y >= 63 && y < 226 && x >= 22 && x < 457) {
-      int col = (x - 22) / 149, row = (y - 63) / 91;
-      settingsView = 1 + row * 3 + col;
-      drawSetup();
+    if (y >= 51 && y < 255 && x >= 22 && x < 457) {
+      int col = (x - 22) / 149, row = (y - 51) / 72;
+      int choice = row * 3 + col;
+      if (choice < 7) { settingsView = choice == 6 ? 8 : choice + 1; drawSetup(); }
     }
     return;
   }
@@ -739,6 +869,17 @@ void handleSettingsTouch(uint16_t x, uint16_t y) {
   } else if (settingsView == 6) {
     if (y >= 147 && y < 187) { prefs.putBool("calnext", true); ESP.restart(); }
     else if (y >= 201 && y < 241) startAp();
+  } else if (settingsView == 8) {
+    if (y >= 94 && y < 133 && x < 459) theme = min(static_cast<int>((x - 22) / 149), 2);
+    else if (y >= 144 && y < 182 && x < 230) { nightMode = !nightMode; autoNight = false; }
+    else if (y >= 144 && y < 182 && x >= 248) { autoNight = !autoNight; updateNightSchedule(); }
+    else if (y >= 191 && y < 229 && x < 230) idleCycle = !idleCycle;
+    else if (y >= 216 && y < 250 && x >= 248 && x < 309) utcOffset = max(-12, static_cast<int>(utcOffset) - 1);
+    else if (y >= 216 && y < 250 && x >= 322 && x < 383) utcOffset = min(14, static_cast<int>(utcOffset) + 1);
+    else if (y >= 250 && x >= 248 && x < 309) nightBacklight = max(5, static_cast<int>(nightBacklight) - 10);
+    else if (y >= 250 && x >= 322 && x < 383) nightBacklight = min(150, static_cast<int>(nightBacklight) + 10);
+    if (autoNight) updateNightSchedule();
+    applyTheme(); saveSettings(); drawSetup();
   } else if (settingsView == 7 && y >= 145 && y < 255 && x >= 22 && x < 459) {
     int choice = ((y - 145) / 62) * 3 + (x - 22) / 149;
     if (choice < 5) { ledTest = choice; drawSetup(); }
@@ -864,6 +1005,7 @@ void setupTouch() {
 }
 
 void startAp() {
+  spotlightOpen = false; idleActive = false;
   alertClient.stop();
   WiFi.disconnect();
   WiFi.mode(WIFI_AP);
@@ -1001,7 +1143,7 @@ void pollProp() {
   bool b = fetchJson("/api/propagation", prop, propFilter);
   propLive = a && b;
   if (!propLive) {
-    if (page == 0 && before.live) drawProp();
+    if (page == 0 && before.live && !spotlightOpen) drawProp();
     return;
   }
   lastPropSuccess = millis();
@@ -1020,12 +1162,12 @@ void pollProp() {
   directCount = prop["my_stations_1h"] | 0;
   regionalCount = prop["regional_stations_1h"] | 0;
   eventState = String(prop["event"]["state"] | "normal");
-  recordTrend();
   bool nowOpen = eventState == "confirmed" || eventState == "peak" ||
                  myScore >= openingScore || regionalScore >= openingScore;
   if (nowOpen && !opening && propAlerts && before.live) notifyColor(55, 24, 0);
   opening = nowOpen;
-  if (page == 0) {
+  recordTrend();
+  if (page == 0 && !spotlightOpen) {
     if (before.live) updatePropChanged(before);
     else drawProp();
   }
@@ -1082,12 +1224,17 @@ void processSpot(const String &line) {
   incoming.receivedUtc = receivedUtc; incoming.receivedAt = millis();
   spots[0] = incoming;
   spotCount = min(static_cast<int>(spotCount) + 1, 5);
+  if (page != 4 && !keyboardOpen) {
+    spotlightOpen = true;
+    spotlightUntil = millis() + 8000;
+    drawSpotlight();
+  }
   if (page != 1) {
     unreadSpot = true;
     tft.fillCircle(174, 291, 6, 0xF9BA);
   }
   if (spotAlerts) notifyColor(45, 0, 32);
-  if (page == 1) draw();
+  if (page == 1 && !spotlightOpen) draw();
 }
 
 void waitForAlertPrompt() {
@@ -1138,8 +1285,15 @@ void handleTouch() {
   uint16_t x, y;
   if (!getTouch(x, y) || millis() - touchTime < 250) return;
   touchTime = millis();
+  lastInteraction = millis();
+  if (spotlightOpen) {
+    spotlightOpen = false; page = 1; selectedSpot = 0; unreadSpot = false; draw(); return;
+  }
+  if (idleActive) { idleActive = false; page = idlePage; draw(); return; }
   Serial.printf("Touch x=%u y=%u page=%u\n", x, y, page);
   if (keyboardOpen) { handleKeyboardTouch(x, y); return; }
+  if (page == 0 && trendExpanded && y < 277) { trendExpanded = false; draw(); return; }
+  if (page == 0 && y >= 190 && y < 271) { trendExpanded = true; draw(); return; }
   if (y >= 277) {
     if (ledTest >= 0) { stopLedTest(); settingsView = 4; }
     page = min(static_cast<int>(x / 96), 4);
@@ -1162,7 +1316,7 @@ void handleTouch() {
 
 void setup() {
   Serial.begin(115200);
-  pinMode(BL, OUTPUT); digitalWrite(BL, HIGH);
+  ledcSetup(3, 5000, 8); ledcAttachPin(BL, 3);
   for (int i = 0; i < 3; ++i) ledcSetup(i, 5000, 8);
   ledcAttachPin(LED_R, 0); ledcAttachPin(LED_G, 1); ledcAttachPin(LED_B, 2);
   ledColor(0, 0, 0);
@@ -1191,6 +1345,14 @@ void setup() {
   spotAlerts = prefs.getBool("spotalert", true);
   meshAlerts = prefs.getBool("meshalert", true);
   openingScore = prefs.getUChar("openscore", 70);
+  theme = min(static_cast<int>(prefs.getUChar("theme", 2)), 2);
+  nightMode = prefs.getBool("night", false);
+  autoNight = prefs.getBool("autonight", false);
+  utcOffset = constrain(static_cast<int>(prefs.getChar("utcoffset", 0)), -12, 14);
+  idleCycle = prefs.getBool("idlecycle", false);
+  normalBacklight = prefs.getUChar("daybl", 255);
+  nightBacklight = constrain(static_cast<int>(prefs.getUChar("nightbl", 35)), 5, 150);
+  applyTheme();
   radarRadiusNm = prefs.getUChar("radarrad", 50);
   if (radarRadiusNm != 25 && radarRadiusNm != 50 && radarRadiusNm != 100) radarRadiusNm = 50;
   tft.init(); tft.setRotation(1); tft.setTextDatum(TL_DATUM);
@@ -1206,12 +1368,28 @@ void setup() {
   draw();
   nextProp = millis() + 1000;
   nextAlertConnect = millis() + 1000;
+  lastInteraction = millis();
   Serial.println("Ham Desk ready");
 }
 
 void loop() {
   web.handleClient();
   handleTouch();
+  bool wasNight = nightMode;
+  updateNightSchedule();
+  if (nightMode != wasNight) draw();
+  if (spotlightOpen && static_cast<int32_t>(millis() - spotlightUntil) >= 0) {
+    spotlightOpen = false; draw();
+  }
+  if (idleCycle && !apMode && !keyboardOpen && !spotlightOpen && page < 4 &&
+      millis() - lastInteraction > 120000) {
+    if (!idleActive) { idleActive = true; idlePage = page; lastIdlePage = millis(); }
+    else if (millis() - lastIdlePage >= 12000) {
+      page = (page + 1) % 3;
+      if (page == 2) nextRadar = millis();
+      lastIdlePage = millis(); draw();
+    }
+  }
   updateLamp();
   if (digitalRead(BOOT) == LOW) {
     if (!bootHold) bootHold = millis();
@@ -1221,6 +1399,7 @@ void loop() {
     }
   } else if (bootHold) {
     if (!bootLong && millis() - bootHold > 50) {
+      lastInteraction = millis(); idleActive = false; trendExpanded = false; spotlightOpen = false;
       if (ledTest >= 0) { stopLedTest(); settingsView = 4; }
       page = (page + 1) % 5;
       if (page == 1) unreadSpot = false;
@@ -1238,12 +1417,12 @@ void loop() {
     pollProp();
   }
   if (!apMode) pollHamAlert();
-  if (!apMode && page == 2 && static_cast<int32_t>(millis() - nextRadar) >= 0) {
+  if (!apMode && page == 2 && !spotlightOpen && static_cast<int32_t>(millis() - nextRadar) >= 0) {
     nextRadar = millis() + 30000;
     pollRadar();
   }
   if (page == 3 && millis() - lastHealthRefresh >= 5000) refreshHealth();
-  if (page == 2 && millis() - lastRadarFrame >= 100) {
+  if (page == 2 && !spotlightOpen && millis() - lastRadarFrame >= 100) {
     lastRadarFrame = millis();
     drawRadarCanvas();
   }
