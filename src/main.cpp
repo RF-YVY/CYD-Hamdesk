@@ -61,6 +61,8 @@ String editorError;
 bool keyboardOpen = false;
 uint32_t nextProp = 0, nextAlertConnect = 0;
 uint32_t nextWifiRetry = 0;
+uint32_t wifiConnectStarted = 0;
+bool wifiConnecting = false;
 uint32_t lastPropSuccess = 0;
 uint32_t lastHealthRefresh = 0;
 uint32_t nextRadar = 0, lastRadarSuccess = 0;
@@ -657,7 +659,7 @@ void drawWifiScan() {
 }
 
 void scanWifi() {
-  if (scanInProgress) return;
+  if (scanInProgress || scanPressLocked) return;
   scanPressLocked = true;
   scanReleaseSince = 0;
   wifiScanView = true;
@@ -730,7 +732,7 @@ void drawSetup() {
     settingRow(87, "Network name (tap to edit)", wifiSsid.isEmpty() ? "Not set" : wifiSsid);
     settingRow(137, "Password (tap to edit)", wifiPassword.isEmpty() ? "Not set" : "********");
     button(22, 192, 204, 34, "SCAN NETWORKS", CYAN, BG);
-    button(240, 192, 216, 34, "CONNECT NOW", CYAN, BG);
+    button(240, 192, 216, 34, wifiConnecting ? "CONNECTING..." : "CONNECT NOW", CYAN, BG);
     button(22, 235, 204, 33, "START SETUP AP");
   } else if (settingsView == 2) {
     text(115, 57, "PROPVIEW", CYAN, 4);
@@ -915,12 +917,14 @@ void saveEditor() {
 
 void handleSettingsTouch(uint16_t x, uint16_t y) {
   if (wifiScanView) {
-    if (x >= 22 && x < 96 && y >= 51 && y < 83) { wifiScanView = false; drawSetup(); }
+    if (x >= 22 && x < 96 && y >= 51 && y < 83) {
+      wifiScanView = false; scanPressLocked = false; drawSetup();
+    }
     else if (x >= 300 && y >= 51 && y < 83) scanWifi();
     else if (x >= 22 && x < 456 && y >= 91 && y < 91 + scanCount * 36) {
       int selected = (y - 91) / 36;
       wifiSsid = scanSsids[selected]; wifiPassword = "";
-      wifiScanView = false; scanSelectionPending = true;
+      wifiScanView = false; scanPressLocked = false; scanSelectionPending = true;
       startEditor(2);
     }
     return;
@@ -1122,6 +1126,8 @@ void setupTouch() {
 }
 
 void startAp() {
+  wifiConnecting = false;
+  wifiScanView = false;
   spotlightOpen = false; idleActive = false;
   alertClient.stop();
   WiFi.disconnect();
@@ -1137,15 +1143,27 @@ void startAp() {
 
 void connectWifi() {
   if (wifiSsid.isEmpty()) { startAp(); return; }
+  if (apMode) WiFi.softAPdisconnect(true);
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
   WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
-  for (int i = 0; i < 40 && WiFi.status() != WL_CONNECTED; ++i) delay(250);
+  apMode = false;
+  wifiConnecting = true;
+  wifiConnectStarted = millis();
+  Serial.println("Wi-Fi connection started");
+}
+
+void serviceWifiConnection() {
+  if (!wifiConnecting) return;
   if (WiFi.status() == WL_CONNECTED) {
-    apMode = false;
+    wifiConnecting = false;
     configTime(0, 0, "pool.ntp.org", "time.nist.gov");
     Serial.printf("Wi-Fi IP: %s\n", WiFi.localIP().toString().c_str());
-  } else startAp();
+    if (page == 4 && settingsView == 1 && !keyboardOpen) drawSetup();
+  } else if (millis() - wifiConnectStarted >= 10000 && !keyboardOpen && !scanSelectionPending) {
+    Serial.println("Wi-Fi connection timed out; starting setup AP");
+    startAp();
+  }
 }
 
 bool authorized() {
@@ -1417,7 +1435,7 @@ void handleTouch() {
     return;
   }
   scanReleaseSince = 0;
-  if (scanPressLocked || millis() - touchTime < 250) return;
+  if (millis() - touchTime < 250) return;
   touchTime = millis();
   lastInteraction = millis();
   if (spotlightOpen) {
@@ -1517,6 +1535,7 @@ void loop() {
   web.handleClient();
   handleTouch();
   finishWifiScan();
+  serviceWifiConnection();
   bool wasNight = nightMode;
   updateNightSchedule();
   if (nightMode != wasNight) draw();
@@ -1551,17 +1570,19 @@ void loop() {
     bootHold = 0;
     bootLong = false;
   }
-  if (!apMode && !scanInProgress && !wifiScanView && WiFi.status() != WL_CONNECTED) {
+  if (!apMode && !wifiConnecting && !keyboardOpen && !scanSelectionPending &&
+      !scanInProgress && !wifiScanView && WiFi.status() != WL_CONNECTED) {
     if (static_cast<int32_t>(millis() - nextWifiRetry) >= 0) {
       nextWifiRetry = millis() + 30000;
       connectWifi(); draw();
     }
   }
-  if (!apMode && !scanInProgress && !wifiScanView && static_cast<int32_t>(millis() - nextProp) >= 0) {
+  if (!apMode && !keyboardOpen && !scanInProgress && !wifiScanView &&
+      static_cast<int32_t>(millis() - nextProp) >= 0) {
     nextProp = millis() + 15000;
     pollProp();
   }
-  if (!apMode && !scanInProgress && !wifiScanView) pollHamAlert();
+  if (!apMode && !keyboardOpen && !scanInProgress && !wifiScanView) pollHamAlert();
   if (!apMode && page == 2 && !spotlightOpen && static_cast<int32_t>(millis() - nextRadar) >= 0) {
     nextRadar = millis() + 30000;
     pollRadar();
