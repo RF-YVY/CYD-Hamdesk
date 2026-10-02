@@ -33,7 +33,17 @@ String setupPassword, meshToken, wifiSsid, wifiPassword, propUrl;
 String hamUser, hamPassword, hamHost;
 uint16_t hamPort = 7300;
 bool lampEnabled = true, apMode = false, gt911 = false, touchReady = false;
-uint8_t lampLevel = 14;
+uint8_t lampPercent = 25;
+bool batterySenseEnabled = false;
+float batteryDivider = 2.0f;
+uint32_t lastBatteryRead = 0;
+int batteryMilliVolts = 0, batteryPercent = -1;
+String scanSsids[5];
+int32_t scanRssi[5] = {};
+bool scanSecured[5] = {};
+uint8_t scanCount = 0;
+bool wifiScanView = false, scanSelectionPending = false;
+bool scanInProgress = false;
 struct Rgb { uint8_t r, g, b; };
 // This particular board's red LED channel remains dark even with GPIO4 driven
 // low directly. Match the on-screen choices to the working green/blue channels.
@@ -49,6 +59,7 @@ uint8_t page = 0;
 uint8_t settingsView = 0, lightTab = 0, editField = 0, keyboardMode = 0;
 int8_t ledTest = -1;
 String editValue;
+String editorError;
 bool keyboardOpen = false;
 uint32_t nextProp = 0, nextAlertConnect = 0;
 uint32_t lastPropSuccess = 0;
@@ -151,6 +162,7 @@ void updateNightSchedule() {
 }
 
 void saveSettings() {
+  prefs.putString("setup", setupPassword);
   prefs.putString("ssid", wifiSsid);
   prefs.putString("wifi", wifiPassword);
   prefs.putString("prop", propUrl);
@@ -159,7 +171,9 @@ void saveSettings() {
   prefs.putString("hamhost", hamHost);
   prefs.putUShort("hamport", hamPort);
   prefs.putBool("lamp", lampEnabled);
-  prefs.putUChar("level", lampLevel);
+  prefs.putUChar("lampPct", lampPercent);
+  prefs.putBool("batsense", batterySenseEnabled);
+  prefs.putFloat("batdiv", batteryDivider);
   prefs.putBytes("tabcolor", tabColor, sizeof(tabColor));
   prefs.putBool("propalert", propAlerts);
   prefs.putBool("spotalert", spotAlerts);
@@ -204,9 +218,9 @@ void updateLamp() {
   } else {
     // Case RGB LED. The LCD backlight is on its own GPIO.
     Rgb c = GB_PALETTE[tabColor[page] % PALETTE_COUNT];
-    ledColor(static_cast<uint16_t>(c.r) * lampLevel / 255,
-             static_cast<uint16_t>(c.g) * lampLevel / 255,
-             static_cast<uint16_t>(c.b) * lampLevel / 255);
+    ledColor(static_cast<uint16_t>(c.r) * lampPercent / 100,
+             static_cast<uint16_t>(c.g) * lampPercent / 100,
+             static_cast<uint16_t>(c.b) * lampPercent / 100);
   }
 }
 
@@ -285,11 +299,18 @@ void drawExpandedTrend() {
   text(23, 249, "PEAK " + String(peakMy) + " / " + String(peakRegion) + "   AMBER: OPENING", WHITE);
 }
 
+void drawBatteryBadge() {
+  tft.fillRect(187, 8, 100, 25, PANEL);
+  tft.setTextColor(batteryPercent >= 0 ? GREEN : MUTED, PANEL);
+  tft.drawString(batteryPercent >= 0 ? "BAT " + String(batteryPercent) + "%" : "BAT --", 192, 14, 2);
+}
+
 void frame(const String &title) {
   tft.fillScreen(BG);
   tft.fillRect(0, 0, W, 41, PANEL);
   tft.setTextColor(WHITE, PANEL);
   tft.drawString("HAM DESK", 13, 9, 4);
+  drawBatteryBadge();
   tft.drawRightString(title, 465, 13, 2);
   tft.fillRect(0, 277, W, 43, PANEL);
   const char *tabs[] = {"PROP", "SPOTS", "RADAR", "HEALTH", "SETUP"};
@@ -607,6 +628,17 @@ void drawSpotlight() {
   text(24, 248, "TAP TO OPEN  |  AUTO CLOSES", AMBER);
 }
 
+void updateBattery() {
+  if (!batterySenseEnabled || millis() - lastBatteryRead < 15000) return;
+  uint32_t sum = 0;
+  for (int i = 0; i < 8; ++i) sum += analogReadMilliVolts(35);
+  batteryMilliVolts = static_cast<int>(sum / 8 * batteryDivider);
+  batteryPercent = batteryMilliVolts < 3000 || batteryMilliVolts > 4350 ? -1 :
+                   constrain((batteryMilliVolts - 3300) * 100 / 900, 0, 100);
+  lastBatteryRead = millis();
+  if (!keyboardOpen && !spotlightOpen) drawBatteryBadge();
+}
+
 void refreshHealth() {
   bool wifiOk = WiFi.status() == WL_CONNECTED;
   bool propOk = wifiOk && propLive && lastPropSuccess && millis() - lastPropSuccess < 30000;
@@ -618,6 +650,10 @@ void refreshHealth() {
   updateText(180, 160, 278, 22, lastPropSuccess ? String((millis() - lastPropSuccess) / 1000) + " sec ago" : "Never", WHITE);
   updateText(180, 194, 278, 22, hamUser.isEmpty() ? "NOT SET" : alertClient.connected() ? "CONNECTED" : "WAITING",
        alertClient.connected() ? GREEN : AMBER);
+  updateText(180, 227, 278, 30,
+             !batterySenseEnabled ? "SENSOR NOT WIRED" : batteryPercent < 0 ? "NO VALID READING" :
+             String(batteryPercent) + "%  " + String(batteryMilliVolts / 1000.0f, 2) + " V",
+             batteryPercent >= 0 ? GREEN : AMBER, 2);
   lastHealthRefresh = millis();
 }
 
@@ -628,8 +664,46 @@ void drawHealth() {
   text(22, 124, "PROPVIEW", MUTED);
   text(22, 160, "LAST GOOD", MUTED);
   text(22, 194, "HAMALERT", MUTED);
+  text(22, 227, "BATTERY", MUTED);
   refreshHealth();
-  text(22, 232, "Touch SETUP to change connections", MUTED);
+}
+
+void drawWifiScan() {
+  frame("WI-FI NETWORKS");
+  button(22, 51, 74, 32, "BACK");
+  button(300, 51, 156, 32, "SCAN AGAIN", CYAN, BG);
+  if (!scanCount) text(22, 105, scanInProgress ? "Scanning nearby networks..." :
+                       "No networks found. Try scanning again.", scanInProgress ? CYAN : AMBER);
+  for (int i = 0; i < scanCount; ++i) {
+    int y = 91 + i * 36;
+    button(22, y, 434, 32, scanSsids[i].substring(0, 25) +
+           "  " + String(scanRssi[i]) + " dBm" + (scanSecured[i] ? "  LOCK" : "  OPEN"));
+  }
+}
+
+void scanWifi() {
+  wifiScanView = true;
+  scanCount = 0;
+  scanInProgress = true;
+  drawWifiScan();
+  if (apMode) WiFi.mode(WIFI_AP_STA);
+  int found = WiFi.scanNetworks(false, false);
+  if (found > 0) {
+    for (int i = 0; i < found && scanCount < 5; ++i) {
+      String ssid = WiFi.SSID(i);
+      if (ssid.isEmpty()) continue;
+      bool duplicate = false;
+      for (int j = 0; j < scanCount; ++j) if (scanSsids[j] == ssid) duplicate = true;
+      if (duplicate) continue;
+      scanSsids[scanCount] = ssid;
+      scanRssi[scanCount] = WiFi.RSSI(i);
+      scanSecured[scanCount] = WiFi.encryptionType(i) != WIFI_AUTH_OPEN;
+      ++scanCount;
+    }
+  }
+  WiFi.scanDelete();
+  scanInProgress = false;
+  drawWifiScan();
 }
 
 void button(int x, int y, int w, int h, const String &label, uint16_t fill,
@@ -646,6 +720,7 @@ void settingRow(int y, const String &label, const String &value) {
 }
 
 void drawSetup() {
+  if (wifiScanView) { drawWifiScan(); return; }
   frame("SETTINGS");
   if (settingsView == 0) {
     const char *items[] = {"WI-FI", "PROPVIEW", "HAMALERT", "CASE LIGHT", "ALERTS", "DEVICE", "DISPLAY"};
@@ -656,10 +731,11 @@ void drawSetup() {
   button(22, 51, 74, 32, "BACK");
   if (settingsView == 1) {
     text(115, 57, "WI-FI", CYAN, 4);
-    settingRow(94, "Network name (tap to edit)", wifiSsid.isEmpty() ? "Not set" : wifiSsid);
-    settingRow(148, "Password (tap to edit)", wifiPassword.isEmpty() ? "Not set" : "********");
-    button(22, 219, 202, 40, "START SETUP AP");
-    button(240, 219, 218, 40, "CONNECT NOW", CYAN, BG);
+    settingRow(87, "Network name (tap to edit)", wifiSsid.isEmpty() ? "Not set" : wifiSsid);
+    settingRow(137, "Password (tap to edit)", wifiPassword.isEmpty() ? "Not set" : "********");
+    button(22, 192, 204, 34, "SCAN NETWORKS", CYAN, BG);
+    button(240, 192, 216, 34, "CONNECT NOW", CYAN, BG);
+    button(22, 235, 204, 33, "START SETUP AP");
   } else if (settingsView == 2) {
     text(115, 57, "PROPVIEW", CYAN, 4);
     settingRow(103, "Server URL (tap to edit)", propUrl.isEmpty() ? "Not set" : propUrl);
@@ -684,11 +760,12 @@ void drawSetup() {
       tft.fillRoundRect(x, y, 54, 28, 5, color);
       if (tabColor[lightTab] == i) tft.drawRoundRect(x - 3, y - 3, 60, 34, 6, WHITE);
     }
-    text(22, 221, "Green/blue light  " + String(lampLevel), WHITE);
-    tft.fillRect(180, 225, 268, 8, PANEL);
-    tft.fillRect(180, 225, lampLevel * 268 / 80, 8, CYAN);
-    button(22, 245, 120, 28, lampEnabled ? "LIGHT ON" : "LIGHT OFF");
-    button(157, 245, 148, 28, "TEST CHANNELS");
+    text(22, 209, "BRIGHTNESS", MUTED);
+    for (int i = 0; i < 5; ++i)
+      button(22 + i * 89, 227, 82, 28, String(i * 25) + "%",
+             lampPercent == i * 25 ? CYAN : PANEL, lampPercent == i * 25 ? BG : WHITE);
+    button(22, 258, 120, 18, lampEnabled ? "LIGHT ON" : "LIGHT OFF");
+    button(157, 258, 148, 18, "TEST CHANNELS");
   } else if (settingsView == 5) {
     text(115, 57, "LED ALERTS", CYAN, 4);
     button(22, 105, 300, 34, propAlerts ? "PROP OPENING: ON" : "PROP OPENING: OFF");
@@ -699,8 +776,9 @@ void drawSetup() {
   } else if (settingsView == 6) {
     text(115, 57, "DEVICE", CYAN, 4);
     text(22, 101, apMode ? "Setup AP: " + WiFi.softAPSSID() : "IP: " + WiFi.localIP().toString(), WHITE);
-    text(22, 124, "Web password: " + setupPassword, MUTED);
-    button(22, 147, 204, 39, "CALIBRATE TOUCH");
+    text(22, 124, "AP / web password: " + setupPassword, MUTED);
+    button(22, 151, 204, 34, "CHANGE PASSWORD");
+    button(240, 151, 216, 34, "CALIBRATE TOUCH");
     button(22, 201, 204, 39, "START SETUP AP");
   } else if (settingsView == 8) {
     text(115, 57, "DISPLAY", CYAN, 4);
@@ -739,8 +817,9 @@ void connectWifi();
 
 const char *fieldName(uint8_t field) {
   const char *names[] = {"", "Wi-Fi network", "Wi-Fi password", "PropView URL",
-                         "HamAlert username", "HamAlert password", "HamAlert host", "HamAlert port"};
-  return field < 8 ? names[field] : "";
+                         "HamAlert username", "HamAlert password", "HamAlert host", "HamAlert port",
+                         "Setup AP / web password"};
+  return field < 9 ? names[field] : "";
 }
 
 const char *keyboardRow(int row) {
@@ -756,6 +835,10 @@ const char *keyboardRow(int row) {
 void drawEditValue() {
   tft.fillRect(17, 70, 446, 29, BG);
   String visible = editValue;
+  if (editField == 2 || editField == 5 || editField == 8) {
+    visible = "";
+    for (size_t i = 0; i < editValue.length(); ++i) visible += '*';
+  }
   if (visible.length() > 40) visible = "..." + visible.substring(visible.length() - 37);
   text(20, 73, visible + "_", WHITE);
 }
@@ -763,7 +846,7 @@ void drawEditValue() {
 void drawKeyboard() {
   tft.fillScreen(BG);
   text(20, 15, fieldName(editField), CYAN, 4);
-  text(20, 49, "Tap keys, then SAVE", MUTED);
+  text(20, 49, editorError.isEmpty() ? "Tap keys, then SAVE" : editorError, editorError.isEmpty() ? MUTED : AMBER);
   drawEditValue();
   for (int row = 0; row < 3; ++row) {
     String keys = keyboardRow(row);
@@ -782,6 +865,7 @@ void drawKeyboard() {
 void startEditor(uint8_t field) {
   editField = field;
   keyboardMode = 0;
+  editorError = "";
   switch (field) {
     case 1: editValue = wifiSsid; break;
     case 2: editValue = wifiPassword; break;
@@ -790,6 +874,7 @@ void startEditor(uint8_t field) {
     case 5: editValue = hamPassword; break;
     case 6: editValue = hamHost; break;
     case 7: editValue = String(hamPort); break;
+    case 8: editValue = ""; break;
     default: editValue = "";
   }
   keyboardOpen = true;
@@ -797,7 +882,10 @@ void startEditor(uint8_t field) {
 }
 
 void saveEditor() {
-  if (editField != 1 && editField != 2 && editField != 5) editValue.trim();
+  if (editField != 1 && editField != 2 && editField != 5 && editField != 8) editValue.trim();
+  if (editField == 8 && (editValue.length() < 8 || editValue.length() > 63)) {
+    editorError = "Password must be 8-63 characters"; drawKeyboard(); return;
+  }
   switch (editField) {
     case 1: wifiSsid = editValue; break;
     case 2: wifiPassword = editValue; break;
@@ -812,13 +900,35 @@ void saveEditor() {
     case 5: hamPassword = editValue; alertClient.stop(); break;
     case 6: hamHost = editValue; alertClient.stop(); break;
     case 7: hamPort = constrain(editValue.toInt(), 1, 65535); alertClient.stop(); break;
+    case 8: setupPassword = editValue; break;
   }
   saveSettings();
   keyboardOpen = false;
+  if (editField == 8 && apMode) {
+    WiFi.softAPdisconnect(true);
+    String suffix = WiFi.macAddress(); suffix.replace(":", "");
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP("HamDesk-" + suffix.substring(suffix.length() - 4), setupPassword.c_str());
+  }
+  if (editField == 2 && scanSelectionPending) {
+    scanSelectionPending = false;
+    connectWifi();
+  }
   drawSetup();
 }
 
 void handleSettingsTouch(uint16_t x, uint16_t y) {
+  if (wifiScanView) {
+    if (x >= 22 && x < 96 && y >= 51 && y < 83) { wifiScanView = false; drawSetup(); }
+    else if (x >= 300 && y >= 51 && y < 83) scanWifi();
+    else if (x >= 22 && x < 456 && y >= 91 && y < 91 + scanCount * 36) {
+      int selected = (y - 91) / 36;
+      wifiSsid = scanSsids[selected]; wifiPassword = "";
+      wifiScanView = false; scanSelectionPending = true;
+      startEditor(2);
+    }
+    return;
+  }
   if (settingsView == 0) {
     if (y >= 51 && y < 255 && x >= 22 && x < 457) {
       int col = (x - 22) / 149, row = (y - 51) / 72;
@@ -833,10 +943,11 @@ void handleSettingsTouch(uint16_t x, uint16_t y) {
     drawSetup(); return;
   }
   if (settingsView == 1) {
-    if (y >= 94 && y < 140) startEditor(1);
-    else if (y >= 148 && y < 195) startEditor(2);
-    else if (y >= 219 && y < 260 && x < 230) startAp();
-    else if (y >= 219 && y < 260 && x >= 240) { connectWifi(); drawSetup(); }
+    if (y >= 87 && y < 131) startEditor(1);
+    else if (y >= 137 && y < 181) startEditor(2);
+    else if (y >= 192 && y < 227 && x < 230) scanWifi();
+    else if (y >= 192 && y < 227 && x >= 240) { connectWifi(); drawSetup(); }
+    else if (y >= 235 && y < 269 && x < 230) startAp();
   } else if (settingsView == 2) {
     if (y >= 103 && y < 147) startEditor(3);
   } else if (settingsView == 3) {
@@ -851,12 +962,13 @@ void handleSettingsTouch(uint16_t x, uint16_t y) {
       int col = (x - 24) / 74, row = (y - 134) / 39;
       int choice = row * 6 + col;
       if (choice < PALETTE_COUNT) { tabColor[lightTab] = choice; saveSettings(); drawSetup(); }
-    } else if (y >= 211 && y < 245 && x >= 175) {
-      lampLevel = constrain((static_cast<int>(x) - 180) * 80 / 268, 0, 80);
+    } else if (y >= 227 && y < 256 && x >= 22 && x < 459) {
+      int choice = (x - 22) / 89;
+      lampPercent = min(choice, 4) * 25;
       saveSettings(); drawSetup();
-    } else if (y >= 245 && y < 276 && x < 145) {
+    } else if (y >= 258 && y < 277 && x < 145) {
       lampEnabled = !lampEnabled; saveSettings(); drawSetup();
-    } else if (y >= 245 && y < 276 && x >= 157 && x < 305) {
+    } else if (y >= 258 && y < 277 && x >= 157 && x < 305) {
       startLedTest(); settingsView = 7; drawSetup();
     }
   } else if (settingsView == 5) {
@@ -867,7 +979,8 @@ void handleSettingsTouch(uint16_t x, uint16_t y) {
     else if (y >= 149 && y < 184 && x >= 398) openingScore = min(100, openingScore + 5);
     saveSettings(); drawSetup();
   } else if (settingsView == 6) {
-    if (y >= 147 && y < 187) { prefs.putBool("calnext", true); ESP.restart(); }
+    if (y >= 151 && y < 186 && x < 230) startEditor(8);
+    else if (y >= 151 && y < 186 && x >= 240) { prefs.putBool("calnext", true); ESP.restart(); }
     else if (y >= 201 && y < 241) startAp();
   } else if (settingsView == 8) {
     if (y >= 94 && y < 133 && x < 459) theme = min(static_cast<int>((x - 22) / 149), 2);
@@ -902,7 +1015,15 @@ void handleKeyboardTouch(uint16_t x, uint16_t y) {
     else if (x < 335 && editValue.length() < 120) { editValue += ' '; drawEditValue(); }
     else if (x >= 337 && editValue.length()) { editValue.remove(editValue.length() - 1); drawEditValue(); }
   } else if (y >= 271) {
-    if (x < 235) { keyboardOpen = false; drawSetup(); }
+    if (x < 235) {
+      keyboardOpen = false;
+      if (scanSelectionPending) {
+        scanSelectionPending = false;
+        wifiSsid = prefs.getString("ssid", "");
+        wifiPassword = prefs.getString("wifi", "");
+      }
+      drawSetup();
+    }
     else if (x >= 250) saveEditor();
   }
 }
@@ -1013,8 +1134,8 @@ void startAp() {
   bool started = WiFi.softAP("HamDesk-" + suffix.substring(suffix.length() - 4), setupPassword.c_str());
   apMode = true;
   page = 4;
-  Serial.printf("Setup AP: %s  started=%d  IP=%s  password: %s\n",
-                WiFi.softAPSSID().c_str(), started, WiFi.softAPIP().toString().c_str(), setupPassword.c_str());
+  Serial.printf("Setup AP: %s  started=%d  IP=%s\n",
+                WiFi.softAPSSID().c_str(), started, WiFi.softAPIP().toString().c_str());
   draw();
 }
 
@@ -1032,7 +1153,7 @@ void connectWifi() {
 }
 
 bool authorized() {
-  if (apMode || web.authenticate("admin", setupPassword.c_str())) return true;
+  if (web.authenticate("admin", setupPassword.c_str())) return true;
   web.requestAuthentication();
   return false;
 }
@@ -1041,16 +1162,22 @@ void setupWeb() {
   web.on("/", HTTP_GET, [] {
     if (!authorized()) return;
     String s = "<!doctype html><meta name='viewport' content='width=device-width,initial-scale=1'><title>Ham Desk</title>";
-    s += "<style>body{font:18px system-ui;background:#0b1725;color:#f3f6f9;max-width:550px;margin:24px auto;padding:16px}input{box-sizing:border-box;width:100%;padding:12px;margin:5px 0 14px;background:#192b3d;border:1px solid #617b91;color:white;border-radius:8px}button{padding:14px 25px;background:#24bbd1;border:0;border-radius:8px;font-weight:bold}</style>";
+    s += "<style>body{font:18px system-ui;background:#0b1725;color:#f3f6f9;max-width:550px;margin:24px auto;padding:16px}input,select{box-sizing:border-box;width:100%;padding:12px;margin:5px 0 14px;background:#192b3d;border:1px solid #617b91;color:white;border-radius:8px}button{padding:14px 25px;background:#24bbd1;border:0;border-radius:8px;font-weight:bold}</style>";
     s += "<h1>Ham Desk setup</h1><form method='post' action='/save'>";
     s += "Wi-Fi name<input name='ssid' value='" + htmlEscape(wifiSsid) + "'>";
     s += "Wi-Fi password<input name='wifi' type='password' placeholder='Leave blank to keep current'>";
+    s += "Setup AP / web password<input name='setup' type='password' minlength='8' maxlength='63' placeholder='Leave blank to keep current'>";
     s += "PropView URL<input name='prop' value='" + htmlEscape(propUrl) + "' placeholder='http://192.168.1.20:8000'>";
     s += "HamAlert Telnet user<input name='hamuser' value='" + htmlEscape(hamUser) + "'>";
     s += "HamAlert Telnet password<input name='hampass' type='password' placeholder='Leave blank to keep current'>";
     s += "HamAlert host<input name='hamhost' value='" + htmlEscape(hamHost) + "'>";
     s += "HamAlert port<input name='hamport' type='number' value='" + String(hamPort) + "'>";
-    s += "Case light brightness (0-80)<input name='level' type='number' min='0' max='80' value='" + String(lampLevel) + "'>";
+    s += "Case light brightness<select name='level'>";
+    for (int i = 0; i <= 100; i += 25)
+      s += "<option value='" + String(i) + "'" + (lampPercent == i ? " selected" : "") + ">" + String(i) + "%</option>";
+    s += "</select>";
+    s += "<label><input name='batsense' type='checkbox' style='width:auto' " + String(batterySenseEnabled ? "checked" : "") + "> Battery voltage sensor on GPIO35 (requires external divider)</label>";
+    s += "Battery divider ratio<input name='batdiv' type='number' min='1.1' max='10' step='0.01' value='" + String(batteryDivider, 2) + "'>";
     s += "<label><input name='lamp' type='checkbox' style='width:auto' " + String(lampEnabled ? "checked" : "") + "> Enable case light</label><p><button>Save and restart</button></form>";
     s.replace("<p><button>Save and restart</button></form>",
       "<p>Opening score threshold (0-100)<input name='openscore' type='number' min='0' max='100' value='" + String(openingScore) + "'>"
@@ -1064,6 +1191,11 @@ void setupWeb() {
   });
   web.on("/save", HTTP_POST, [] {
     if (!authorized()) return;
+    String requestedPassword = web.arg("setup");
+    if (requestedPassword.length() && (requestedPassword.length() < 8 || requestedPassword.length() > 63)) {
+      web.send(400, "text/plain", "Setup password must be 8-63 characters."); return;
+    }
+    if (requestedPassword.length()) setupPassword = requestedPassword;
     wifiSsid = web.arg("ssid"); wifiSsid.trim();
     if (web.arg("wifi").length()) wifiPassword = web.arg("wifi");
     propUrl = web.arg("prop"); propUrl.trim();
@@ -1072,8 +1204,10 @@ void setupWeb() {
     if (web.arg("hampass").length()) hamPassword = web.arg("hampass");
     hamHost = web.arg("hamhost"); hamHost.trim();
     hamPort = constrain(web.arg("hamport").toInt(), 1, 65535);
-    lampLevel = constrain(web.arg("level").toInt(), 0, 80);
+    lampPercent = constrain(web.arg("level").toInt() / 25 * 25, 0, 100);
     lampEnabled = web.hasArg("lamp");
+    batterySenseEnabled = web.hasArg("batsense");
+    batteryDivider = constrain(web.arg("batdiv").toFloat(), 1.1f, 10.0f);
     openingScore = constrain(web.arg("openscore").toInt(), 0, 100);
     propAlerts = web.hasArg("propalert");
     spotAlerts = web.hasArg("spotalert");
@@ -1297,6 +1431,7 @@ void handleTouch() {
   if (y >= 277) {
     if (ledTest >= 0) { stopLedTest(); settingsView = 4; }
     page = min(static_cast<int>(x / 96), 4);
+    if (page != 4) wifiScanView = false;
     if (page == 1) unreadSpot = false;
     if (page == 2) nextRadar = millis();
     draw();
@@ -1330,7 +1465,17 @@ void setup() {
   propUrl = prefs.getString("prop", ""); hamUser = prefs.getString("hamuser", "");
   hamPassword = prefs.getString("hampass", ""); hamHost = prefs.getString("hamhost", "hamalert.org");
   hamPort = prefs.getUShort("hamport", 7300);
-  lampEnabled = prefs.getBool("lamp", true); lampLevel = prefs.getUChar("level", 14);
+  lampEnabled = prefs.getBool("lamp", true);
+  if (prefs.isKey("lampPct")) lampPercent = prefs.getUChar("lampPct", 25);
+  else {
+    uint8_t oldLevel = prefs.getUChar("level", 14);
+    lampPercent = constrain(((static_cast<int>(oldLevel) * 100 / 80 + 12) / 25) * 25, 0, 100);
+  }
+  batterySenseEnabled = prefs.getBool("batsense", false);
+  batteryDivider = prefs.getFloat("batdiv", 2.0f);
+  if (batteryDivider < 1.1f || batteryDivider > 10.0f) batteryDivider = 2.0f;
+  if (batterySenseEnabled) analogSetPinAttenuation(35, ADC_11db);
+  lastBatteryRead = millis() - 15000;
   if (prefs.getBytesLength("tabcolor") == sizeof(tabColor))
     prefs.getBytes("tabcolor", tabColor, sizeof(tabColor));
   else if (prefs.getBytesLength("tabcolor") == 4) {
@@ -1375,6 +1520,7 @@ void setup() {
 void loop() {
   web.handleClient();
   handleTouch();
+  updateBattery();
   bool wasNight = nightMode;
   updateNightSchedule();
   if (nightMode != wasNight) draw();
