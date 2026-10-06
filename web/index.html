@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#101923">
+  <title>Ham Desk · Web Flasher</title>
+  <link rel="stylesheet" href="style.css">
+  <script type="module" src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"></script>
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <main>
+    <header><a class="brand" href="https://github.com/RF-YVY/CYD-Hamdesk">HAM DESK <span>CYD</span></a><a href="https://github.com/RF-YVY/CYD-Hamdesk">Source code ↗</a></header>
+    <section class="intro">
+      <p class="eyebrow">YOUR RADIO DESK, ON DISPLAY</p>
+      <h1>A fresh view.<br>A simple install.</h1>
+      <p class="lead">Install Ham Desk directly from your browser. PropView, HamAlert, aircraft radar, a local clock, battery monitoring, and full RGB case lighting.</p>
+      <div class="badges"><span>E32R35T · 3.5″</span><span>ESP32-WROOM-32E</span><span>ST7796 · Resistive touch</span></div>
+    </section>
+    <section class="install-grid" aria-label="Firmware installation options">
+      <article class="card">
+        <p class="eyebrow">ALREADY RUNNING HAM DESK?</p>
+        <h2>Update firmware</h2>
+        <p>Keep your saved Wi-Fi, service settings, and touch calibration. Leave <strong>Erase device</strong> unchecked in the installer. Use this for a device already running this project's E32R35T firmware and partition layout.</p>
+        <esp-web-install-button manifest="manifest-update.json" data-installer>
+          <button slot="activate" disabled>Update Ham Desk</button>
+          <p slot="unsupported">Use desktop Chrome or Edge with Web Serial support.</p>
+          <p slot="not-allowed">Open this page over HTTPS or localhost.</p>
+        </esp-web-install-button>
+      </article>
+      <article class="card">
+        <p class="eyebrow">NEW DEVICE OR DIFFERENT FIRMWARE?</p>
+        <h2>Erase &amp; install</h2>
+        <p>Install the complete bootloader, partitions, and firmware. This erases saved device settings. Use it when switching from HaleHound or another firmware.</p>
+        <esp-web-install-button manifest="manifest-install.json" data-installer>
+          <button slot="activate" class="secondary" disabled>Erase &amp; install Ham Desk</button>
+          <p slot="unsupported">Use desktop Chrome or Edge with Web Serial support.</p>
+          <p slot="not-allowed">Open this page over HTTPS or localhost.</p>
+        </esp-web-install-button>
+      </article>
+    </section>
+    <p id="build-status" class="build" role="status">Checking firmware availability…</p>
+    <p class="build">Downloads: <a href="firmware/hamdesk-e32r35t-install.bin">Full installation</a> · <a href="firmware/hamdesk-e32r35t-update.bin">Application update</a> · <a href="firmware/SHA256SUMS.txt">SHA-256 checksums</a></p>
+    <section class="card steps">
+      <h2>From USB to your desk</h2>
+      <ol>
+        <li><strong>Connect.</strong> Plug your E32R35T into your computer with a USB data cable. Close serial monitors or other apps using its port.</li>
+        <li><strong>Install.</strong> Choose an option above and select the USB-SERIAL CH340 device. On this project's development PC, it is COM13; yours may differ.</li>
+        <li><strong>Configure.</strong> On the CYD, open SETUP → WI-FI, then configure PropView and HamAlert. SETUP → CLOCK selects local time; CASE LIGHT selects static colors or the RGB gradient.</li>
+      </ol>
+      <p class="muted">The flasher detects the ESP32 chip family, not the display-board model. This build is for the E32R35T layout with battery sensing on GPIO34 and red LED on GPIO22.</p>
+    </section>
+    <details class="card"><summary>Connection troubleshooting</summary><p>If no port appears, try another data cable or install your device vendor's CH340 driver. If automatic connection fails, hold BOOT while starting the connection, then release it after connecting. Wi-Fi setup happens on the device; this firmware does not use browser-based Improv Wi-Fi provisioning.</p></details>
+    <footer>Built with <a href="https://esphome.github.io/esp-web-tools/">ESP Web Tools</a> · <a href="https://github.com/RF-YVY/CYD-Hamdesk/blob/main/README.md">Setup guide</a></footer>
+  </main>
+</body>
+</html>

@@ -6,3 +6,6 @@ __pycache__/
 .env
 .env.*
 *.local.ini
+web/firmware/
+web/manifest-*.json
+web/build.json

@@ -8,16 +8,144 @@
 #include <WiFiClientSecure.h>
 #include <Wire.h>
 #include <time.h>
+#include <esp_sntp.h>
+#include "noaa_ca.h"
 
 namespace {
 constexpr int W = 480, H = 320;
-constexpr int BL = 27, LED_R = 4, LED_G = 16, LED_B = 17, BOOT = 0;
+// E32R35T: red LED is GPIO22; GPIO4 is the active-low audio amplifier enable.
+constexpr int BL = 27, LED_R = 22, LED_G = 16, LED_B = 17, BOOT = 0;
+constexpr int AUDIO_EN = 4, BATTERY_ADC = 34;
+int batteryMv = 0, batteryPercent = -1;
+bool batteryValid = false;
+float batterySmoothMv = 0;
+uint32_t lastBatterySample = 0, redTestUntil = 0;
+String diagnosticCommand;
+
+// A generic single-cell LiPo approximation, not a measured state of charge.
+int percentFromBatteryMv(int mv) {
+  const int volts[] = {3300,3500,3600,3700,3800,3900,4000,4100,4200};
+  const int levels[] = {0,5,10,20,40,60,80,90,100};
+  if(mv<=volts[0]) return 0;
+  for(int i=1;i<9;++i) if(mv<=volts[i])
+    return levels[i-1]+(mv-volts[i-1])*(levels[i]-levels[i-1])/(volts[i]-volts[i-1]);
+  return 100;
+}
+
+void sampleBattery(bool force=false) {
+  if(!force && millis()-lastBatterySample<3000) return;
+  lastBatterySample=millis();
+  uint32_t sum=0;
+  for(int i=0;i<16;++i) sum+=analogReadMilliVolts(BATTERY_ADC);
+  int candidateMv=static_cast<int>((sum*2+8)/16); // Existing 100k/100k divider.
+  batteryValid=candidateMv>=2500 && candidateMv<=4500;
+  if(!batteryValid) {batteryMv=0; batteryPercent=-1; batterySmoothMv=0; return;}
+  batterySmoothMv=batterySmoothMv?batterySmoothMv*0.75f+candidateMv*0.25f:candidateMv;
+  batteryMv=static_cast<int>(roundf(batterySmoothMv));
+  batteryPercent=percentFromBatteryMv(batteryMv);
+}
+
+void logBattery() {
+  if(batteryValid) Serial.printf("Battery GPIO34: %d mV, estimated %d%%\n",batteryMv,batteryPercent);
+  else Serial.println("Battery GPIO34: reading unavailable / outside valid range");
+}
+
+void setupBattery() {
+  pinMode(BATTERY_ADC,INPUT);
+  analogReadResolution(12);
+  analogSetPinAttenuation(BATTERY_ADC,ADC_11db);
+  sampleBattery(true); logBattery();
+  bool ok=percentFromBatteryMv(3300)==0 && percentFromBatteryMv(4200)==100 &&
+          percentFromBatteryMv(3750)==30 && percentFromBatteryMv(5000)==100;
+  for(int mv=3301;mv<=4200;++mv) ok=ok && percentFromBatteryMv(mv)>=percentFromBatteryMv(mv-1);
+  Serial.printf("Battery curve checks: %s\n",ok?"PASS":"FAIL");
+}
 uint16_t BG = 0x0843, PANEL = 0x10A5, WHITE = 0xEF7D;
 uint16_t MUTED = 0x8C71, CYAN = 0x45FA, AMBER = 0xFCA1;
 uint16_t GREEN = 0x67EC, RED = 0xFA69;
 uint8_t theme = 2;
 bool nightMode = false, autoNight = false, idleCycle = false;
-int8_t utcOffset = 0;
+int16_t utcMinutes = 0;
+uint8_t zonePreset = 0, lampMode = 0, gradientSpeed = 1;
+uint8_t spotlightSeconds = 8, quietStart = 22, quietEnd = 6;
+bool quietHours = false;
+volatile bool clockSynced = false;
+uint32_t clockSyncAt = 0, lastBanner = 0;
+uint8_t bandFilter = 0, modeFilter = 0, spotPage = 0;
+constexpr int SPOT_CAPACITY = 30;
+uint8_t visibleSpots[5], visibleCount = 0;
+String spaceWeather = "NOAA: waiting", spaceStamp;
+uint32_t nextSpace = 0, lastSpace = 0;
+uint8_t loginStage = 0;
+uint32_t loginDeadline = 0;
+const char *ZONES[] = {"FIXED OFFSET", "US EASTERN", "US CENTRAL", "US MOUNTAIN", "US PACIFIC"};
+const char *TZ_RULES[] = {"UTC0", "EST5EDT,M3.2.0,M11.1.0", "CST6CDT,M3.2.0,M11.1.0", "MST7MDT,M3.2.0,M11.1.0", "PST8PDT,M3.2.0,M11.1.0"};
+void configureZone() { setenv("TZ", TZ_RULES[zonePreset], 1); tzset(); }
+void localParts(time_t epoch, struct tm &parts) {
+  if (zonePreset) localtime_r(&epoch, &parts);
+  else { epoch += utcMinutes * 60; gmtime_r(&epoch, &parts); }
+}
+String localStamp(time_t epoch, bool date = false) {
+  if (epoch < 1600000000) return "Time unavailable";
+  struct tm parts; localParts(epoch, parts); char buf[32];
+  strftime(buf, sizeof(buf), date ? "%m/%d %I:%M %p" : "%I:%M %p", &parts);
+  return String(buf);
+}
+String offsetLabel() {
+  char buf[20]; snprintf(buf, sizeof(buf), "UTC%c%02d:%02d", utcMinutes < 0 ? '-' : '+', abs(utcMinutes)/60, abs(utcMinutes)%60);
+  return String(buf);
+}
+bool inQuietHours() {
+  if (!quietHours || time(nullptr) < 1600000000) return false;
+  struct tm parts; localParts(time(nullptr), parts);
+  return quietStart < quietEnd ? parts.tm_hour >= quietStart && parts.tm_hour < quietEnd : parts.tm_hour >= quietStart || parts.tm_hour < quietEnd;
+}
+void onTimeSync(struct timeval *) { clockSynced = true; clockSyncAt = millis(); }
+time_t parseSpotTime(String value, time_t received) {
+  value.trim();
+  if(value.length()==4 && value[0]>='0' && value[0]<='9' && value[1]>='0' && value[1]<='9' && value[2]>='0' && value[2]<='9' && value[3]>='0' && value[3]<='9') value=value.substring(0,2)+":"+value.substring(2);
+  if (value.length() >= 10 && value.indexOf('-') < 0 && value.indexOf(':') < 0) {
+    char *end; long long n = strtoll(value.c_str(), &end, 10);
+    if (*end == 0) { if (n > 100000000000LL) n /= 1000; if (n >= 1600000000LL && n < 4102444800LL) return n; }
+  }
+  struct tm parts = {}; int y,m,d,h,minute,sec=0;
+  if (sscanf(value.c_str(), "%d-%d-%dT%d:%d:%d", &y,&m,&d,&h,&minute,&sec) >= 5 ||
+      sscanf(value.c_str(), "%d-%d-%d %d:%d:%d", &y,&m,&d,&h,&minute,&sec) >= 5) {
+    if (y<2020 || y>2099 || m<1 || m>12 || d<1 || d>31 || h<0 || h>23 || minute<0 || minute>59 || sec<0 || sec>60) return 0;
+    parts.tm_year=y-1900; parts.tm_mon=m-1; parts.tm_mday=d; parts.tm_hour=h; parts.tm_min=minute; parts.tm_sec=sec;
+    // UTC civil date to epoch, independent of configured display timezone.
+    int year=y-(m<=2), era=year/400; unsigned yo=year-era*400;
+    unsigned day=(153*(m+(m>2?-3:9))+2)/5+d-1;
+    time_t result=(era*146097L+yo*365+yo/4-yo/100+day-719468L)*86400LL+h*3600+minute*60+sec;
+    int signAt=max(value.indexOf('+',19), value.indexOf('-',19));
+    if (signAt>=0) { int oh=0,om=0; if(sscanf(value.substring(signAt+1).c_str(),"%d:%d",&oh,&om)>=1) result+=(value[signAt]=='+'?-1:1)*(oh*3600+om*60); }
+    return result;
+  }
+  value.replace("Z", ""); value.replace(" UTC", "");
+  if (received >= 1600000000 && sscanf(value.c_str(), "%d:%d:%d", &h,&minute,&sec)>=2 && h>=0 && h<24 && minute>=0 && minute<60 && sec>=0 && sec<60) {
+    time_t result=(received/86400)*86400+h*3600+minute*60+sec;
+    if (result>received+300) result-=86400; return result;
+  }
+  return 0;
+}
+
+void checkTimeFormatting() {
+  uint8_t savedZone=zonePreset; int16_t savedMinutes=utcMinutes; int passed=0,total=0;
+  auto check=[&](bool ok) {++total; if(ok) ++passed;};
+  const time_t jan=parseSpotTime("2026-01-15T12:00:00Z",0);
+  const time_t jul=parseSpotTime("2026-07-15T12:00:00Z",0);
+  check(jan==1768478400); check(jul==1784116800);
+  check(parseSpotTime("2026-01-15T07:00:00-05:00",0)==jan);
+  check(parseSpotTime("1768478400000",0)==jan);
+  check(parseSpotTime("1200",jan)==jan);
+  check(parseSpotTime("23:59Z",jan-12*3600)==jan-12*3600-60);
+  check(parseSpotTime("invalid",jan)==0); check(parseSpotTime("25:10",jan)==0);
+  zonePreset=0; utcMinutes=330; configureZone(); check(localStamp(jan)=="05:30 PM");
+  utcMinutes=-720; check(localStamp(jan)=="12:00 AM");
+  zonePreset=2; configureZone(); check(localStamp(jan)=="06:00 AM"); check(localStamp(jul)=="07:00 AM");
+  zonePreset=savedZone; utcMinutes=savedMinutes; configureZone();
+  Serial.printf("Time checks: %d/%d passed\n",passed,total);
+}
 uint8_t normalBacklight = 255, nightBacklight = 35;
 uint32_t lastInteraction = 0, lastIdlePage = 0, spotlightUntil = 0;
 bool spotlightOpen = false, trendExpanded = false, idleActive = false;
@@ -43,13 +171,13 @@ bool scanInProgress = false, scanPressLocked = false;
 bool scanFailed = false;
 uint32_t scanStartedAt = 0;
 struct Rgb { uint8_t r, g, b; };
-// This particular board's red LED channel remains dark even with GPIO4 driven
-// low directly. Match the on-screen choices to the working green/blue channels.
-constexpr Rgb GB_PALETTE[] = {{0, 190, 45}, {0, 255, 255}, {0, 255, 0},
-                              {0, 140, 0}, {0, 255, 90}, {0, 90, 255},
-                              {0, 0, 255}, {0, 50, 255}, {0, 170, 255},
-                              {0, 255, 160}, {0, 80, 80}, {0, 0, 0}};
-constexpr int PALETTE_COUNT = sizeof(GB_PALETTE) / sizeof(GB_PALETTE[0]);
+constexpr Rgb RGB_PALETTE[] = {{255,0,0}, {255,100,0}, {255,255,0},
+                              {140,255,0}, {0,255,0}, {0,255,255},
+                              {0,130,255}, {0,0,255}, {140,0,255},
+                              {255,0,255}, {255,255,255}, {0,0,0}};
+constexpr const char *RGB_NAMES[] = {"RED","ORANGE","YELLOW","LIME","GREEN","CYAN",
+                                    "SKY BLUE","BLUE","VIOLET","MAGENTA","WHITE","OFF"};
+constexpr int PALETTE_COUNT = sizeof(RGB_PALETTE) / sizeof(RGB_PALETTE[0]);
 uint8_t tabColor[5] = {0, 9, 6, 6, 7};
 bool propAlerts = true, spotAlerts = true, meshAlerts = true;
 uint8_t openingScore = 70;
@@ -119,9 +247,10 @@ struct PropSnapshot {
 String alertLine;
 struct Spot {
   String call, freq, mode, spotter, location, comment, spotTime, receivedUtc;
+  time_t spotEpoch = 0, receivedEpoch = 0;
   uint32_t receivedAt = 0;
 };
-Spot spots[5];
+Spot spots[SPOT_CAPACITY];
 uint8_t spotCount = 0;
 int8_t selectedSpot = -1;
 bool unreadSpot = false;
@@ -177,7 +306,7 @@ void updateNightSchedule() {
   if (!autoNight) return;
   time_t now = time(nullptr);
   if (now < 1600000000) return;
-  int hour = ((now / 3600 + utcOffset) % 24 + 24) % 24;
+  struct tm parts; localParts(now, parts); int hour = parts.tm_hour;
   bool shouldDim = hour >= 22 || hour < 6;
   if (shouldDim != nightMode) { nightMode = shouldDim; applyTheme(); }
 }
@@ -194,6 +323,7 @@ void saveSettings() {
   prefs.putBool("lamp", lampEnabled);
   prefs.putUChar("lampPct", lampPercent);
   prefs.putBytes("tabcolor", tabColor, sizeof(tabColor));
+  prefs.putUChar("palettever",1);
   prefs.putBool("propalert", propAlerts);
   prefs.putBool("spotalert", spotAlerts);
   prefs.putBool("meshalert", meshAlerts);
@@ -201,7 +331,10 @@ void saveSettings() {
   prefs.putUChar("theme", theme);
   prefs.putBool("night", nightMode);
   prefs.putBool("autonight", autoNight);
-  prefs.putChar("utcoffset", utcOffset);
+  prefs.putShort("utcmins", utcMinutes);
+  prefs.putUChar("zone", zonePreset); prefs.putUChar("lampmode", lampMode);
+  prefs.putUChar("speed", gradientSpeed); prefs.putUChar("spotsec", spotlightSeconds);
+  prefs.putBool("quiet", quietHours); prefs.putUChar("qstart", quietStart); prefs.putUChar("qend", quietEnd);
   prefs.putBool("idlecycle", idleCycle);
   prefs.putUChar("daybl", normalBacklight);
   prefs.putUChar("nightbl", nightBacklight);
@@ -211,14 +344,23 @@ void saveSettings() {
 }
 
 void ledColor(uint8_t r, uint8_t g, uint8_t b) {
-  ledcWrite(0, 255);  // Red emitter is not responding on this unit.
+  ledcWrite(0, 255 - r);
   ledcWrite(1, 255 - g);
   ledcWrite(2, 255 - b);
 }
 
 void notifyColor(uint8_t r, uint8_t g, uint8_t b) {
-  alertR = r; alertG = g; alertB = b;
+  if (inQuietHours()) return;
+  alertR = 0; alertG = g; alertB = b;
   alertUntil = millis() + 7000;
+}
+
+Rgb rollingColor() {
+  const uint32_t periods[] = {60000,30000,12000};
+  float hue=(millis()%periods[gradientSpeed])*6.0f/periods[gradientSpeed];
+  return {static_cast<uint8_t>(255*constrain(fabsf(hue-3)-1,0.0f,1.0f)),
+          static_cast<uint8_t>(255*constrain(2-fabsf(hue-2),0.0f,1.0f)),
+          static_cast<uint8_t>(255*constrain(2-fabsf(hue-4),0.0f,1.0f))};
 }
 
 void updateLamp() {
@@ -236,10 +378,16 @@ void updateLamp() {
   if (!lampEnabled) { ledColor(0, 0, 0); return; }
   if (static_cast<int32_t>(alertUntil - millis()) > 0) {
     const float pulse = 0.55f + 0.45f * sinf(millis() / 330.0f);
-    ledColor(alertR * pulse, alertG * pulse, alertB * pulse);
+    Rgb base = RGB_PALETTE[tabColor[page] % PALETTE_COUNT];
+    if (lampMode) base=rollingColor();
+    float blend=min(1.0f,(alertUntil-millis())/1000.0f);
+    ledColor((alertR*pulse*blend+base.r*(1-blend))*lampPercent/100,
+                (alertG*pulse*blend+base.g*(1-blend))*lampPercent/100,
+                (alertB*pulse*blend+base.b*(1-blend))*lampPercent/100);
   } else {
     // Case RGB LED. The LCD backlight is on its own GPIO.
-    Rgb c = GB_PALETTE[tabColor[page] % PALETTE_COUNT];
+    Rgb c = RGB_PALETTE[tabColor[page] % PALETTE_COUNT];
+    if (lampMode) c=rollingColor();
     ledColor(static_cast<uint16_t>(c.r) * lampPercent / 100,
              static_cast<uint16_t>(c.g) * lampPercent / 100,
              static_cast<uint16_t>(c.b) * lampPercent / 100);
@@ -258,6 +406,7 @@ void stopLedTest() {
   ledcWrite(0, 255); ledcWrite(1, 255); ledcWrite(2, 255);
   ledcAttachPin(LED_R, 0); ledcAttachPin(LED_G, 1); ledcAttachPin(LED_B, 2);
   ledTest = -1;
+  redTestUntil = 0;
 }
 
 void text(int x, int y, const String &s, uint16_t color = WHITE, int font = 2) {
@@ -321,21 +470,41 @@ void drawExpandedTrend() {
   text(23, 249, "PEAK " + String(peakMy) + " / " + String(peakRegion) + "   AMBER: OPENING", WHITE);
 }
 
-void frame(const String &title) {
-  tft.fillScreen(BG);
-  tft.fillRect(0, 0, W, 41, PANEL);
-  tft.setTextColor(WHITE, PANEL);
-  tft.drawString("HAM DESK", 13, 9, 4);
-  tft.drawRightString(title, 465, 13, 2);
-  tft.fillRect(0, 277, W, 43, PANEL);
-  const char *tabs[] = {"PROP", "SPOTS", "RADAR", "HEALTH", "SETUP"};
-  for (int i = 0; i < 5; ++i) {
-    int x = i * 96;
-    if (i == page) tft.fillRect(x + 7, 279, 82, 3, CYAN);
-    tft.setTextColor(i == page ? WHITE : MUTED, PANEL);
-    tft.drawCentreString(tabs[i], x + 48, 292, 2);
+void drawBanner(bool force = true) {
+  String clock=time(nullptr)>=1600000000 ? localStamp(time(nullptr)) : "SYNCING...";
+  bool hold=WiFi.status()!=WL_CONNECTED || millis()-clockSyncAt>86400000;
+  static String previous;
+  String key=clock+String(WiFi.status())+String(loginStage)+String(alertClient.connected())+String(clockSynced)+String(hold)+String(batteryPercent);
+  if(!force && key==previous) return;
+  previous=key;
+  tft.fillRect(0,0,W,41,PANEL); tft.setTextColor(WHITE,PANEL);
+  tft.drawString("HAM DESK",13,13,2);
+  tft.drawCentreString(clock,240,7,4);
+  tft.fillCircle(348,12,3,WiFi.status()==WL_CONNECTED?GREEN:AMBER);
+  tft.fillCircle(361,12,3,alertClient.connected() && loginStage==4?CYAN:MUTED);
+  tft.setTextColor(clockSynced && !hold?GREEN:AMBER,PANEL); tft.drawString(clockSynced?(hold?"HOLD":"NTP"):"WAIT",341,22,1);
+  uint16_t ink=!batteryValid?MUTED:batteryPercent<=10?RED:batteryPercent<=25?AMBER:GREEN;
+  tft.drawRoundRect(382,12,24,13,2,ink); tft.fillRect(406,16,3,5,ink);
+  if(batteryValid) {
+    int width=batteryPercent*20/100;
+    if(width) tft.fillRect(384,14,width,9,ink);
   }
-  if (unreadSpot) tft.fillCircle(174, 291, 6, 0xF9BA);
+  tft.setTextColor(ink,PANEL);
+  tft.drawRightString(batteryValid?"~"+String(batteryPercent)+"%":"--",470,10,2);
+  tft.drawFastHLine(0,40,W,0x2948);
+}
+void frame(const String &title) {
+  tft.fillScreen(BG); drawBanner();
+  // A subtle content boundary and five distinct navigation buttons.
+  tft.drawRoundRect(10,45,460,229,9,0x2948);
+  tft.fillRect(0,277,W,43,PANEL);
+  const char *tabs[]={"PROP","SPOTS","RADAR","HEALTH","SETUP"};
+  for(int i=0;i<5;++i) {
+    int x=i*96; uint16_t fill=i==page?CYAN:BG;
+    tft.fillRoundRect(x+4,282,88,33,7,fill);
+    tft.setTextColor(i==page?BG:MUTED,fill); tft.drawCentreString(tabs[i],x+48,290,2);
+  }
+  if(unreadSpot) tft.fillCircle(174,291,5,AMBER);
 }
 
 void drawProp() {
@@ -350,6 +519,8 @@ void drawProp() {
     text(24, 112, propUrl.substring(0, 48), MUTED);
     return;
   }
+  tft.drawRoundRect(16,49,217,111,8,0x2948);
+  tft.drawRoundRect(246,49,217,111,8,0x2948);
   text(22, 56, "MY STATION", MUTED);
   text(22, 81, String(myScore, 0), CYAN, 4);
   text(94, 91, myLevel, CYAN);
@@ -538,7 +709,7 @@ void pollRadar() {
   WiFiClientSecure client;
   client.setInsecure();  // Public, read-only aircraft feed; no credentials sent.
   HTTPClient http;
-  http.setTimeout(8000);
+  http.setConnectTimeout(1200); http.setTimeout(2200);
   http.setUserAgent("HamDesk-CYD/1.0");
   http.useHTTP10(true);
   String url = "https://api.adsb.lol/v2/point/" +
@@ -598,74 +769,97 @@ void pollRadar() {
   Serial.printf("Radar: %u aircraft, free heap %u\n", aircraftCount, ESP.getFreeHeap());
 }
 
+int spotBand(const Spot &s) {
+  float f=s.freq.toFloat(); if(f>1000) f/=1000;
+  if(f>=1.8 && f<2) return 1; if(f>=3.5 && f<4) return 2;
+  if(f>=7 && f<7.3) return 3; if(f>=10.1 && f<10.15) return 4;
+  if(f>=14 && f<14.35) return 5; if(f>=18.068 && f<18.168) return 6;
+  if(f>=21 && f<21.45) return 7; if(f>=24.89 && f<24.99) return 8;
+  if(f>=28 && f<29.7) return 9; if(f>=50 && f<54) return 10; return 11;
+}
+const char *BANDS[]={"ALL","160m","80m","40m","30m","20m","17m","15m","12m","10m","6m","OTHER"};
+const char *MODES[]={"ALL","CW","SSB","DIGITAL"};
+bool spotMatches(const Spot &s) {
+  if(bandFilter && spotBand(s)!=bandFilter) return false;
+  String mode=s.mode; mode.toUpperCase();
+  if(modeFilter==1) return mode=="CW";
+  if(modeFilter==2) return mode=="SSB" || mode=="USB" || mode=="LSB";
+  if(modeFilter==3) return mode!="CW" && mode!="SSB" && mode!="USB" && mode!="LSB" && !mode.isEmpty();
+  return true;
+}
 void drawSpots() {
-  frame("HAMALERT TELNET");
-  if (selectedSpot >= 0 && selectedSpot < spotCount) {
-    const Spot &s = spots[selectedSpot];
-    button(22, 51, 74, 30, "BACK");
-    text(112, 51, s.call, WHITE, 4);
-    text(22, 90, s.freq + "  " + s.mode, CYAN, 4);
-    text(354, 94, s.spotTime.substring(0, 12), MUTED);
-    text(22, 121, "STATION LOCATION", MUTED);
-    text(22, 139, s.location.isEmpty() ? "Not provided in this spot" : s.location.substring(0, 52), WHITE);
-    text(22, 163, "SPOTTER", MUTED);
-    text(22, 181, s.spotter.isEmpty() ? "Not provided" : s.spotter, WHITE);
-    text(22, 207, "COMMENT", MUTED);
-    text(22, 225, s.comment.isEmpty() ? "No comment" : s.comment.substring(0, 55), WHITE);
-    if (s.comment.length() > 55) text(22, 243, s.comment.substring(55, 105), WHITE);
-    text(22, 260, "Received " + s.receivedUtc, MUTED);
-    return;
+  frame("HAMALERT");
+  if(selectedSpot>=0 && selectedSpot<spotCount) {
+    const Spot &s=spots[selectedSpot]; button(22,51,74,30,"BACK");
+    text(112,51,s.call,WHITE,4); text(22,91,s.freq+"  "+s.mode,CYAN,4);
+    text(22,126,"SPOT "+(s.spotEpoch?localStamp(s.spotEpoch,true):String("Time unavailable")),WHITE);
+    text(22,149,"RX   "+localStamp(s.receivedEpoch,true),MUTED);
+    text(22,173,s.location.isEmpty()?"Location not provided":s.location.substring(0,52),WHITE);
+    text(22,198,"SPOTTER "+s.spotter.substring(0,32),MUTED);
+    text(22,224,s.comment.substring(0,55),WHITE);
+    text(22,246,s.comment.substring(55,105),MUTED); return;
   }
-  if (hamUser.isEmpty() || hamPassword.isEmpty()) {
-    text(24, 67, "Set HamAlert login in SETUP", AMBER, 4);
-    return;
+  button(22,50,137,30,String("BAND ")+BANDS[bandFilter]);
+  button(171,50,137,30,String("MODE ")+MODES[modeFilter]);
+  button(320,50,137,30,"PAGE "+String(spotPage+1));
+  visibleCount=0; int matched=0;
+  for(int i=0;i<spotCount;++i) if(spotMatches(spots[i])) {
+    if(matched>=spotPage*5 && visibleCount<5) visibleSpots[visibleCount++]=i; ++matched;
   }
-  text(22, 50, alertClient.connected() ? "CONNECTED" : "RECONNECTING", alertClient.connected() ? GREEN : AMBER);
-  if (!spotCount) text(22, 91, "Waiting for spots...", MUTED, 4);
-  for (int i = 0; i < spotCount; ++i) {
-    int y = 79 + i * 37;
-    text(22, y, spots[i].call, WHITE, 4);
-    text(200, y + 6, spots[i].freq + "  " + spots[i].mode, CYAN);
-    text(393, y + 6, spots[i].spotTime.substring(0, 5), MUTED);
-    tft.drawFastHLine(22, y + 31, 436, 0x2948);
+  if(!visibleCount && spotPage) {spotPage=0; drawSpots(); return;}
+  if(!visibleCount) text(22,113,hamUser.isEmpty()?"Set HamAlert login in SETUP":"Waiting for matching spots",MUTED,4);
+  for(int i=0;i<visibleCount;++i) {
+    const Spot &s=spots[visibleSpots[i]]; int y=85+i*33;
+    tft.fillRoundRect(18,y,444,30,6,PANEL); tft.setTextColor(WHITE,PANEL);
+    tft.drawString(s.call.substring(0,12),25,y+6,2);
+    tft.setTextColor(CYAN,PANEL); tft.drawString((s.freq+" "+s.mode).substring(0,23),163,y+6,2);
+    tft.setTextColor(MUTED,PANEL); tft.drawRightString(s.spotEpoch?localStamp(s.spotEpoch):"--",453,y+6,2);
   }
+  text(22,253,String(matched)+" spots  "+(alertClient.connected() && loginStage==4?"CONNECTED":"RECONNECTING"),MUTED);
 }
 
 void drawSpotlight() {
   if (!spotCount) return;
   const Spot &s = spots[0];
   tft.fillScreen(BG);
-  tft.fillRect(0, 0, W, 42, PANEL);
-  tft.setTextColor(AMBER, PANEL);
-  tft.drawString("NEW HAMALERT SPOT", 18, 10, 4);
+  drawBanner();
+  tft.drawRoundRect(12,48,456,222,12,CYAN);
   text(24, 64, s.call.substring(0, 18), WHITE, 4);
   text(24, 115, (s.freq + "  " + s.mode).substring(0, 30), CYAN, 4);
   text(24, 163, s.location.substring(0, 50), WHITE);
   text(24, 191, s.comment.substring(0, 52), MUTED);
+  text(24,218,"SPOT "+(s.spotEpoch?localStamp(s.spotEpoch):String("Time unavailable")),MUTED);
   text(24, 248, "TAP TO OPEN  |  AUTO CLOSES", AMBER);
 }
 
 void refreshHealth() {
   bool wifiOk = WiFi.status() == WL_CONNECTED;
   bool propOk = wifiOk && propLive && lastPropSuccess && millis() - lastPropSuccess < 30000;
-  updateText(180, 52, 278, 30, wifiOk ? "CONNECTED" : "OFFLINE", wifiOk ? GREEN : RED, 4);
-  updateText(180, 90, 278, 22, wifiOk ?
+  updateText(160, 52, 298, 22, wifiOk ? "CONNECTED" : "OFFLINE", wifiOk ? GREEN : RED);
+  updateText(160, 82, 298, 22, wifiOk ?
        WiFi.localIP().toString() + "  " + String(WiFi.RSSI()) + " dBm" : "--", WHITE);
-  updateText(180, 124, 278, 30, propUrl.isEmpty() ? "NOT SET" : propOk ? "LIVE" : "WAITING",
-       propOk ? GREEN : AMBER, 4);
-  updateText(180, 160, 278, 22, lastPropSuccess ? String((millis() - lastPropSuccess) / 1000) + " sec ago" : "Never", WHITE);
-  updateText(180, 194, 278, 22, hamUser.isEmpty() ? "NOT SET" : alertClient.connected() ? "CONNECTED" : "WAITING",
+  updateText(160, 112, 298, 22, propUrl.isEmpty() ? "NOT SET" : propOk ? "LIVE" : "WAITING",
+       propOk ? GREEN : AMBER);
+  updateText(160, 142, 298, 22, lastPropSuccess ? String((millis() - lastPropSuccess) / 1000) + " sec ago" : "Never", WHITE);
+  updateText(160, 172, 298, 22, hamUser.isEmpty() ? "NOT SET" : alertClient.connected() ? "CONNECTED" : "WAITING",
        alertClient.connected() ? GREEN : AMBER);
+  updateText(160,202,298,22,batteryValid?String(batteryMv/1000.0f,3)+" V  /  ~"+String(batteryPercent)+"%":"Reading unavailable",
+             batteryValid && batteryPercent<=10?RED:WHITE);
+  updateText(22,227,436,20,spaceWeather.substring(0,52),CYAN);
+  updateText(22,249,436,20,lastSpace ? spaceStamp.substring(0,24)+"  "+String((millis()-lastSpace)/60000)+"m ago"+(millis()-lastSpace>1800000?" STALE":"") : "NOAA SWPC / waiting for feed",MUTED);
   lastHealthRefresh = millis();
 }
 
 void drawHealth() {
   frame("CONNECTION HEALTH");
   text(22, 52, "WI-FI", MUTED);
-  text(22, 90, "IP / SIGNAL", MUTED);
-  text(22, 124, "PROPVIEW", MUTED);
-  text(22, 160, "LAST GOOD", MUTED);
-  text(22, 194, "HAMALERT", MUTED);
+  text(22, 82, "IP / SIGNAL", MUTED);
+  text(22, 112, "PROPVIEW", MUTED);
+  text(22, 142, "LAST GOOD", MUTED);
+  text(22, 172, "HAMALERT", MUTED);
+  text(22, 202, "BATTERY", MUTED);
+  text(22,227,spaceWeather.substring(0,52),CYAN);
+  text(22,249,lastSpace ? spaceStamp.substring(0,24)+"  "+String((millis()-lastSpace)/60000)+"m ago" : "NOAA SWPC / waiting for feed",MUTED);
   refreshHealth();
 }
 
@@ -736,6 +930,7 @@ void finishWifiScan() {
 void button(int x, int y, int w, int h, const String &label, uint16_t fill,
             uint16_t ink) {
   tft.fillRoundRect(x, y, w, h, 7, fill);
+  tft.drawRoundRect(x, y, w, h, 7, fill == CYAN ? WHITE : 0x2948);
   tft.setTextColor(ink, fill);
   tft.drawCentreString(label, x + w / 2, y + (h - 16) / 2, 2);
 }
@@ -750,8 +945,8 @@ void drawSetup() {
   if (wifiScanView) { drawWifiScan(); return; }
   frame("SETTINGS");
   if (settingsView == 0) {
-    const char *items[] = {"WI-FI", "PROPVIEW", "HAMALERT", "CASE LIGHT", "ALERTS", "DEVICE", "DISPLAY", "RADAR"};
-    for (int i = 0; i < 8; ++i)
+    const char *items[] = {"WI-FI", "PROPVIEW", "HAMALERT", "CASE LIGHT", "ALERTS", "DEVICE", "DISPLAY", "RADAR", "CLOCK"};
+    for (int i = 0; i < 9; ++i)
       button(22 + (i % 3) * 149, 51 + (i / 3) * 72, 137, 60, items[i]);
     return;
   }
@@ -776,18 +971,20 @@ void drawSetup() {
     settingRow(224, "Port", String(hamPort));
   } else if (settingsView == 4) {
     text(115, 57, "CASE LIGHT", CYAN, 4);
-    const char *names[] = {"PROP", "SPOTS", "RADAR", "HEALTH", "SETUP"};
-    for (int i = 0; i < 5; ++i)
-      button(22 + i * 89, 91, 82, 33, names[i], i == lightTab ? CYAN : PANEL,
-             i == lightTab ? BG : WHITE);
+    button(22,91,137,33,lampMode?"GRADIENT":"STATIC",CYAN,BG);
+    const char *speeds[]={"SLOW","MEDIUM","FAST"};
+    button(171,91,137,33,speeds[gradientSpeed]);
+    const char *names[]={"PROP","SPOTS","RADAR","HEALTH","SETUP"};
+    button(320,91,137,33,names[lightTab]);
     for (int i = 0; i < PALETTE_COUNT; ++i) {
-      Rgb c = GB_PALETTE[i];
+      Rgb c = RGB_PALETTE[i];
       uint16_t color = tft.color565(c.r, c.g, c.b);
       int x = 27 + (i % 6) * 74, y = 137 + (i / 6) * 39;
       tft.fillRoundRect(x, y, 54, 28, 5, color);
       if (tabColor[lightTab] == i) tft.drawRoundRect(x - 3, y - 3, 60, 34, 6, WHITE);
     }
     text(22, 209, "BRIGHTNESS", MUTED);
+    text(248,209,RGB_NAMES[tabColor[lightTab]],WHITE);
     for (int i = 0; i < 5; ++i)
       button(22 + i * 89, 227, 82, 28, String(i * 25) + "%",
              lampPercent == i * 25 ? CYAN : PANEL, lampPercent == i * 25 ? BG : WHITE);
@@ -800,6 +997,9 @@ void drawSetup() {
     button(22, 195, 300, 34, meshAlerts ? "MESH: ON" : "MESH: OFF");
     text(337, 111, "Score " + String(openingScore), WHITE);
     button(335, 149, 48, 34, "-"); button(398, 149, 48, 34, "+");
+    button(22,238,137,32,String("POP ")+spotlightSeconds+"s");
+    button(171,238,137,32,quietHours?"QUIET ON":"QUIET OFF");
+    button(320,238,137,32,"QUIET HOURS");
   } else if (settingsView == 6) {
     text(115, 57, "DEVICE", CYAN, 4);
     text(22, 101, apMode ? "Setup AP: " + WiFi.softAPSSID() : "IP: " + WiFi.localIP().toString(), WHITE);
@@ -814,6 +1014,22 @@ void drawSetup() {
     button(22, 200, 204, 38, manualRadar ? "MANUAL: ACTIVE" : "USE MANUAL");
     button(240, 200, 216, 38, manualRadar ? "USE PROPVIEW" : "PROPVIEW: ACTIVE");
     text(22, 253, manualLatSet && manualLonSet ? "Wi-Fi required for aircraft feed" : "Enter both coordinates first", MUTED);
+  } else if (settingsView == 11) {
+    text(115,57,"QUIET HOURS",CYAN,4);
+    text(22,105,"Suppress LED alerts and spotlight",MUTED);
+    button(22,146,208,45,"START "+String(quietStart)+":00");
+    button(248,146,208,45,"END "+String(quietEnd)+":00");
+    text(22,218,"Tap to advance hour. Uses local time.",MUTED);
+    text(22,244,"Equal start/end means quiet all day.",MUTED);
+  } else if (settingsView == 10) {
+    text(115,57,"LOCAL TIME",CYAN,4);
+    button(22,91,436,36,String(ZONES[zonePreset]));
+    text(22,138,offsetLabel()+"  (fixed mode)",WHITE);
+    button(22,166,96,34,"-1 HR"); button(130,166,96,34,"+1 HR");
+    button(240,166,102,34,"-15 MIN"); button(354,166,102,34,"+15 MIN");
+    button(22,213,208,35,"SYNC NIST NOW");
+    text(248,220,clockSynced?"NTP synchronized":"Waiting for NIST",clockSynced?GREEN:AMBER);
+    text(22,253,zonePreset?"US preset: automatic daylight saving":"Fixed offset: adjust for daylight saving",MUTED);
   } else if (settingsView == 8) {
     text(115, 57, "DISPLAY", CYAN, 4);
     const char *names[] = {"GREEN", "AMBER", "CYAN"};
@@ -823,8 +1039,8 @@ void drawSetup() {
     button(22, 144, 208, 37, nightMode ? "NIGHT: ON" : "NIGHT: OFF");
     button(248, 144, 208, 37, autoNight ? "22-06: AUTO" : "AUTO: OFF");
     button(22, 191, 208, 37, idleCycle ? "IDLE CYCLE: ON" : "IDLE CYCLE: OFF");
-    text(248, 192, "UTC OFFSET " + String(utcOffset), WHITE);
-    button(248, 216, 60, 34, "-"); button(322, 216, 60, 34, "+");
+    text(248, 192, "TIME: SETUP > CLOCK", MUTED);
+    button(248, 216, 208, 30, "CLOCK SETTINGS");
     text(22, 251, "Night dim: " + String(nightBacklight) + "/255", MUTED);
     button(248, 250, 60, 26, "DIM-"); button(322, 250, 60, 26, "DIM+");
   } else {
@@ -979,7 +1195,7 @@ void handleSettingsTouch(uint16_t x, uint16_t y) {
     if (y >= 51 && y < 255 && x >= 22 && x < 457) {
       int col = (x - 22) / 149, row = (y - 51) / 72;
       int choice = row * 3 + col;
-      if (choice < 8) { settingsView = choice == 6 ? 8 : choice == 7 ? 9 : choice + 1; drawSetup(); }
+      if (choice < 9) { settingsView = choice == 8 ? 10 : choice == 6 ? 8 : choice == 7 ? 9 : choice + 1; drawSetup(); }
     }
     return;
   }
@@ -1003,7 +1219,7 @@ void handleSettingsTouch(uint16_t x, uint16_t y) {
     else if (y >= 224 && y < 268) startEditor(7);
   } else if (settingsView == 4) {
     if (y >= 91 && y < 125 && x >= 22 && x < 467) {
-      lightTab = min(static_cast<int>((x - 22) / 89), 4); drawSetup();
+      if(x<159) lampMode=!lampMode; else if(x<308) gradientSpeed=(gradientSpeed+1)%3; else lightTab=(lightTab+1)%5; saveSettings(); drawSetup();
     } else if (y >= 134 && y < 205 && x >= 24 && x < 467) {
       int col = (x - 24) / 74, row = (y - 134) / 39;
       int choice = row * 6 + col;
@@ -1023,6 +1239,10 @@ void handleSettingsTouch(uint16_t x, uint16_t y) {
     else if (y >= 195 && y < 229 && x < 325) meshAlerts = !meshAlerts;
     else if (y >= 149 && y < 184 && x >= 335 && x < 386) openingScore = max(0, openingScore - 5);
     else if (y >= 149 && y < 184 && x >= 398) openingScore = min(100, openingScore + 5);
+    else if(y>=238 && y<270) {
+      if(x<159) spotlightSeconds=spotlightSeconds>=20?0:spotlightSeconds+4;
+      else if(x<308) quietHours=!quietHours; else {settingsView=11;}
+    }
     saveSettings(); drawSetup();
   } else if (settingsView == 6) {
     if (y >= 151 && y < 186 && x < 230) startEditor(8);
@@ -1036,13 +1256,21 @@ void handleSettingsTouch(uint16_t x, uint16_t y) {
     } else if (y >= 200 && y < 239 && x >= 240 && x < 456) {
       manualRadar = false; resetRadarCenter(); saveSettings(); drawSetup();
     }
+  } else if (settingsView == 11) {
+    if(y>=146 && y<191) {if(x<230) quietStart=(quietStart+1)%24; else quietEnd=(quietEnd+1)%24;}
+    saveSettings(); drawSetup();
+  } else if (settingsView == 10) {
+    if(y>=91 && y<127) zonePreset=(zonePreset+1)%5;
+    else if(y>=166 && y<200) {
+      zonePreset=0; utcMinutes=constrain(utcMinutes+(x<118?-60:x<226?60:x<342?-15:15),-720,840);
+    } else if(y>=213 && y<248 && x<230) { clockSynced=false; sntp_stop(); configTime(0,0,"time.nist.gov","pool.ntp.org"); }
+    configureZone(); saveSettings(); drawSetup();
   } else if (settingsView == 8) {
     if (y >= 94 && y < 133 && x < 459) theme = min(static_cast<int>((x - 22) / 149), 2);
     else if (y >= 144 && y < 182 && x < 230) { nightMode = !nightMode; autoNight = false; }
     else if (y >= 144 && y < 182 && x >= 248) { autoNight = !autoNight; updateNightSchedule(); }
     else if (y >= 191 && y < 229 && x < 230) idleCycle = !idleCycle;
-    else if (y >= 216 && y < 250 && x >= 248 && x < 309) utcOffset = max(-12, static_cast<int>(utcOffset) - 1);
-    else if (y >= 216 && y < 250 && x >= 322 && x < 383) utcOffset = min(14, static_cast<int>(utcOffset) + 1);
+    else if (y >= 216 && y < 250 && x >= 248) settingsView = 10;
     else if (y >= 250 && x >= 248 && x < 309) nightBacklight = max(5, static_cast<int>(nightBacklight) - 10);
     else if (y >= 250 && x >= 322 && x < 383) nightBacklight = min(150, static_cast<int>(nightBacklight) + 10);
     if (autoNight) updateNightSchedule();
@@ -1211,7 +1439,8 @@ void serviceWifiConnection() {
   if (!wifiConnecting) return;
   if (WiFi.status() == WL_CONNECTED) {
     wifiConnecting = false;
-    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  sntp_set_time_sync_notification_cb(onTimeSync);
+    configTime(0, 0, "time.nist.gov", "pool.ntp.org"); configureZone();
     Serial.printf("Wi-Fi IP: %s\n", WiFi.localIP().toString().c_str());
     if (page == 4 && settingsView == 1 && !keyboardOpen) drawSetup();
   } else if (millis() - wifiConnectStarted >= 10000 && !keyboardOpen && !scanSelectionPending) {
@@ -1250,6 +1479,16 @@ void setupWeb() {
     for (int i = 0; i <= 100; i += 25)
       s += "<option value='" + String(i) + "'" + (lampPercent == i ? " selected" : "") + ">" + String(i) + "%</option>";
     s += "</select>";
+    s += "<h2>Clock and effects</h2>Timezone<select name='zone'>";
+    for(int i=0;i<5;++i) s += "<option value='"+String(i)+"'"+String(zonePreset==i?" selected":"")+">"+ZONES[i]+"</option>";
+    s += "</select>Fixed UTC offset (minutes)<input name='utcmins' type='number' min='-720' max='840' step='15' value='"+String(utcMinutes)+"'>";
+    s += "LED effect<select name='lampmode'><option value='0'"+String(!lampMode?" selected":"")+">Static per tab</option><option value='1'"+String(lampMode?" selected":"")+">Full RGB rainbow gradient</option></select>";
+    s += "Gradient speed<select name='speed'>";
+    const char *speeds[]={"Slow (60s)","Medium (30s)","Fast (12s)"};
+    for(int i=0;i<3;++i) s += "<option value='"+String(i)+"'"+String(gradientSpeed==i?" selected":"")+">"+speeds[i]+"</option>";
+    s += "</select>Spotlight duration (0 disables)<input name='spotsec' type='number' min='0' max='20' value='"+String(spotlightSeconds)+"'>";
+    s += "<label><input name='quiet' type='checkbox' style='width:auto' "+String(quietHours?"checked":"")+"> Quiet hours</label>";
+    s += "Start hour<input name='qstart' type='number' min='0' max='23' value='"+String(quietStart)+"'>End hour<input name='qend' type='number' min='0' max='23' value='"+String(quietEnd)+"'>";
     s += "<label><input name='lamp' type='checkbox' style='width:auto' " + String(lampEnabled ? "checked" : "") + "> Enable case light</label><p><button>Save and restart</button></form>";
     s.replace("<p><button>Save and restart</button></form>",
       "<p>Opening score threshold (0-100)<input name='openscore' type='number' min='0' max='100' value='" + String(openingScore) + "'>"
@@ -1290,6 +1529,12 @@ void setupWeb() {
     hamPort = constrain(web.arg("hamport").toInt(), 1, 65535);
     lampPercent = constrain(web.arg("level").toInt() / 25 * 25, 0, 100);
     lampEnabled = web.hasArg("lamp");
+    if(web.hasArg("zone")) zonePreset=constrain(web.arg("zone").toInt(),0,4);
+    if(web.hasArg("utcmins")) utcMinutes=constrain(web.arg("utcmins").toInt(),-720,840);
+    if(web.hasArg("lampmode")) lampMode=constrain(web.arg("lampmode").toInt(),0,1);
+    if(web.hasArg("speed")) gradientSpeed=constrain(web.arg("speed").toInt(),0,2);
+    if(web.hasArg("spotsec")) spotlightSeconds=constrain(web.arg("spotsec").toInt(),0,20);
+    if(web.hasArg("qstart")) {quietHours=web.hasArg("quiet"); quietStart=constrain(web.arg("qstart").toInt(),0,23); quietEnd=constrain(web.arg("qend").toInt(),0,23);}
     openingScore = constrain(web.arg("openscore").toInt(), 0, 100);
     propAlerts = web.hasArg("propalert");
     spotAlerts = web.hasArg("spotalert");
@@ -1329,7 +1574,7 @@ void setupWeb() {
 bool fetchJson(const String &path, JsonDocument &doc, JsonDocument &filter) {
   if (propUrl.isEmpty() || WiFi.status() != WL_CONNECTED) return false;
   HTTPClient http;
-  http.setTimeout(6500);
+  http.setConnectTimeout(1200); http.setTimeout(1800);
   if (!http.begin(propUrl + path)) return false;
   // A local Tailscale relay can require this device-specific token. Direct
   // PropView instances ignore the extra header.
@@ -1420,6 +1665,9 @@ void processSpot(const String &line) {
   if (comment.isEmpty()) comment = String(doc["comments"] | "");
   String spotTime = doc["time"] | "";
   if (spotTime.isEmpty()) spotTime = String(doc["timestamp"] | "");
+  if(spotTime.isEmpty() && doc["timestamp"].is<int64_t>()) spotTime=doc["timestamp"].as<String>();
+  String spotDate=doc["date"] | "";
+  if(!spotDate.isEmpty() && spotTime.length()<=9) spotTime=spotDate+"T"+spotTime;
   String receivedUtc = "time unavailable";
   time_t now = time(nullptr);
   if (now > 1600000000) {
@@ -1429,20 +1677,24 @@ void processSpot(const String &line) {
     strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M UTC", &utc);
     receivedUtc = timestamp;
   }
-  if (spotTime.isEmpty() && receivedUtc != "time unavailable")
-    spotTime = receivedUtc.substring(11, 16) + "Z";
-  if (selectedSpot >= 0) selectedSpot = selectedSpot >= 4 ? -1 : selectedSpot + 1;
-  for (int i = 4; i > 0; --i) spots[i] = spots[i - 1];
+  time_t parsed = parseSpotTime(spotTime, now);
+  for(int i=0;i<spotCount;++i) {
+    if(spots[i].call==call && spots[i].freq==freq && spots[i].mode==mode && spots[i].spotter==spotter &&
+       ((parsed && spots[i].spotEpoch==parsed) || (!parsed && millis()-spots[i].receivedAt<60000))) return;
+  }
+  if (selectedSpot >= 0) selectedSpot = selectedSpot >= SPOT_CAPACITY-1 ? -1 : selectedSpot + 1;
+  for (int i = SPOT_CAPACITY-1; i > 0; --i) spots[i] = spots[i - 1];
   Spot incoming;
   incoming.call = call; incoming.freq = freq; incoming.mode = mode;
   incoming.spotter = spotter; incoming.location = location;
   incoming.comment = comment; incoming.spotTime = spotTime;
   incoming.receivedUtc = receivedUtc; incoming.receivedAt = millis();
+  incoming.spotEpoch = parsed; incoming.receivedEpoch = now;
   spots[0] = incoming;
-  spotCount = min(static_cast<int>(spotCount) + 1, 5);
-  if (page != 4 && !keyboardOpen) {
+  spotCount = min(static_cast<int>(spotCount) + 1, SPOT_CAPACITY);
+  if (page != 4 && !keyboardOpen && spotlightSeconds && !inQuietHours() && spotMatches(incoming)) {
     spotlightOpen = true;
-    spotlightUntil = millis() + 8000;
+    spotlightUntil = millis() + spotlightSeconds*1000;
     drawSpotlight();
   }
   if (page != 1) {
@@ -1453,42 +1705,83 @@ void processSpot(const String &line) {
   if (page == 1 && !spotlightOpen) draw();
 }
 
-void waitForAlertPrompt() {
-  uint32_t started = millis();
-  while (alertClient.connected() && millis() - started < 2500) {
-    if (alertClient.available()) {
-      while (alertClient.available()) alertClient.read();
-      return;
-    }
-    delay(20);
+void pollHamAlert() {
+  if(hamUser.isEmpty() || hamPassword.isEmpty() || WiFi.status()!=WL_CONNECTED) return;
+  if(!alertClient.connected()) {
+    loginStage=0;
+    if(static_cast<int32_t>(millis()-nextAlertConnect)<0) return;
+    nextAlertConnect=millis()+10000;
+    if(!alertClient.connect(hamHost.c_str(),hamPort,900)) return;
+    loginStage=1; loginDeadline=millis()+2500; alertLine="";
   }
+  if(loginStage<4) {
+    bool prompt=false; int budget=512;
+    while(alertClient.available() && budget-->0) {alertClient.read(); prompt=true;}
+    if(prompt || static_cast<int32_t>(millis()-loginDeadline)>=0) {
+      if(loginStage==1) alertClient.println(hamUser);
+      else if(loginStage==2) alertClient.println(hamPassword);
+      else {alertClient.println("set/json"); lastAlertKeepalive=millis();}
+      ++loginStage; loginDeadline=millis()+2500;
+    }
+    return;
+  }
+  int budget=2048;
+  while(alertClient.available() && budget-->0) {
+    char c=alertClient.read();
+    if(c=='\n') {processSpot(alertLine); alertLine="";}
+    else if(c!='\r' && alertLine.length()<4096) alertLine+=c;
+  }
+  if(millis()-lastAlertKeepalive>=120000) {alertClient.println("echo"); lastAlertKeepalive=millis();}
 }
 
-void pollHamAlert() {
-  if (hamUser.isEmpty() || hamPassword.isEmpty() || WiFi.status() != WL_CONNECTED) return;
-  if (!alertClient.connected()) {
-    if (static_cast<int32_t>(millis() - nextAlertConnect) < 0) return;
-    nextAlertConnect = millis() + 10000;
-    if (!alertClient.connect(hamHost.c_str(), hamPort, 3500)) return;
-    // Same Telnet negotiation used by HamView on the SenseCAP Indicator.
-    waitForAlertPrompt();
-    alertClient.println(hamUser);
-    waitForAlertPrompt();
-    alertClient.println(hamPassword);
-    waitForAlertPrompt();
-    alertClient.println("set/json");
-    alertLine = "";
-    lastAlertKeepalive = millis();
-    if (page == 1) draw();
+void pollSpaceWeather() {
+  if(WiFi.status()!=WL_CONNECTED || time(nullptr)<1600000000) return;
+  WiFiClientSecure client; client.setCACert(NOAA_CA); client.setHandshakeTimeout(5);
+  HTTPClient http; http.setConnectTimeout(1200); http.setTimeout(1800);
+  http.useHTTP10(true);
+  if(!http.begin(client,"https://services.swpc.noaa.gov/products/noaa-scales.json")) return;
+  int response=http.GET();
+  if(response==200) {
+    StaticJsonDocument<256> filter; filter["0"]["R"]["Scale"]=true;
+    filter["0"]["S"]["Scale"]=true; filter["0"]["G"]["Scale"]=true;
+    filter["0"]["DateStamp"]=true; filter["0"]["TimeStamp"]=true;
+    StaticJsonDocument<512> doc;
+    DeserializationError error=deserializeJson(doc,http.getStream(),DeserializationOption::Filter(filter));
+    if(!error) {
+      JsonObject current=doc["0"]; if(!current.isNull()) {
+        spaceWeather="NOAA  R"+String(current["R"]["Scale"]|"?")+"  S"+String(current["S"]["Scale"]|"?")+"  G"+String(current["G"]["Scale"]|"?");
+        time_t epoch=parseSpotTime(String(current["DateStamp"]|"")+"T"+String(current["TimeStamp"]|""),time(nullptr));
+        spaceStamp=epoch?localStamp(epoch,true):"Time unavailable"; lastSpace=millis();
+        Serial.println("NOAA scales received over verified TLS");
+      }
+    } else Serial.printf("NOAA parse error: %s\n",error.c_str());
+  } else Serial.printf("NOAA HTTP result: %d\n",response);
+  http.end();
+}
+// Deliberately limited USB diagnostics: no credentials or service configuration.
+void serviceDiagnostics() {
+  int budget=64;
+  while(Serial.available() && budget-->0) {
+    char c=Serial.read();
+    if(c=='\n' || c=='\r') {
+      if(diagnosticCommand=="battery") {sampleBattery(true); logBattery();}
+      else if(diagnosticCommand=="redtest") {
+        spotlightOpen=false; keyboardOpen=false;
+        startLedTest(); redTestUntil=millis()+45000;
+        page=4; settingsView=7; draw(); updateLamp();
+        Serial.printf("RED TEST: GPIO22=%d GREEN GPIO16=%d BLUE GPIO17=%d AUDIO GPIO4=%d; 45 seconds\n",
+                      digitalRead(LED_R),digitalRead(LED_G),digitalRead(LED_B),digitalRead(AUDIO_EN));
+      } else if(diagnosticCommand=="ledstop") {
+        if(ledTest>=0) stopLedTest(); settingsView=4; draw();
+        Serial.println("LED diagnostic stopped");
+      }
+      diagnosticCommand="";
+    } else if(diagnosticCommand.length()<20) diagnosticCommand+=c;
   }
-  int budget = 2048;
-  while (alertClient.available() && budget-- > 0) {
-    char c = alertClient.read();
-    if (c == '\n') { processSpot(alertLine); alertLine = ""; }
-    else if (c != '\r' && alertLine.length() < 4096) alertLine += c;
-  }
-  if (millis() - lastAlertKeepalive >= 120000) {
-    alertClient.println("echo"); lastAlertKeepalive = millis();
+  if(redTestUntil && static_cast<int32_t>(millis()-redTestUntil)>=0) {
+    if(ledTest>=0) stopLedTest();
+    if(page==4 && settingsView==7) {settingsView=4; draw();}
+    redTestUntil=0; Serial.println("RED TEST ended; normal case light restored");
   }
 }
 
@@ -1508,6 +1801,7 @@ void handleTouch() {
   }
   if (idleActive) { idleActive = false; page = idlePage; draw(); return; }
   Serial.printf("Touch x=%u y=%u page=%u\n", x, y, page);
+  if(!keyboardOpen) tft.drawFastHLine(0,40,W,CYAN);
   if (keyboardOpen) { handleKeyboardTouch(x, y); return; }
   if (page == 0 && trendExpanded && y < 277) { trendExpanded = false; draw(); return; }
   if (page == 0 && y >= 190 && y < 271) { trendExpanded = true; draw(); return; }
@@ -1522,9 +1816,12 @@ void handleTouch() {
   else if (page == 1) {
     if (selectedSpot >= 0) {
       if (x >= 22 && x < 96 && y >= 51 && y < 83) { selectedSpot = -1; drawSpots(); }
-    } else if (y >= 79 && y < 79 + spotCount * 37) {
-      selectedSpot = (y - 79) / 37;
-      drawSpots();
+    } else if(y>=50 && y<80) {
+      if(x<159) {bandFilter=(bandFilter+1)%12; spotPage=0;}
+      else if(x<308) {modeFilter=(modeFilter+1)%4; spotPage=0;}
+      else spotPage=(spotPage+1)%6; drawSpots();
+    } else if (y >= 85 && y < 85 + visibleCount * 33) {
+      selectedSpot = visibleSpots[(y-85)/33]; drawSpots();
     }
   }
   else if (page == 2) handleRadarTouch(x, y);
@@ -1534,6 +1831,8 @@ void handleTouch() {
 
 void setup() {
   Serial.begin(115200);
+  digitalWrite(AUDIO_EN,HIGH); pinMode(AUDIO_EN,OUTPUT); // Keep unused amplifier off.
+  setupBattery();
   ledcSetup(3, 5000, 8); ledcAttachPin(BL, 3);
   for (int i = 0; i < 3; ++i) ledcSetup(i, 5000, 8);
   ledcAttachPin(LED_R, 0); ledcAttachPin(LED_G, 1); ledcAttachPin(LED_B, 2);
@@ -1564,6 +1863,21 @@ void setup() {
     prefs.putBytes("tabcolor", tabColor, sizeof(tabColor));
   }
   for (uint8_t &color : tabColor) if (color >= PALETTE_COUNT) color = 0;
+  if(prefs.getUChar("palettever",0)<1) {
+    // Match saved green/blue choices to their nearest color in the new palette.
+    const Rgb old[]={{0,190,45},{0,255,255},{0,255,0},{0,140,0},{0,255,90},{0,90,255},
+                     {0,0,255},{0,50,255},{0,170,255},{0,255,160},{0,80,80},{0,0,0}};
+    for(uint8_t &color:tabColor) {
+      Rgb c=old[color]; int best=INT_MAX; uint8_t selected=0;
+      for(int i=0;i<PALETTE_COUNT;++i) {
+        Rgb n=RGB_PALETTE[i]; int r=int(c.r)-n.r,g=int(c.g)-n.g,b=int(c.b)-n.b;
+        int distance=r*r+g*g+b*b;
+        if(distance<best) {best=distance; selected=i;}
+      }
+      color=selected;
+    }
+    prefs.putBytes("tabcolor",tabColor,sizeof(tabColor)); prefs.putUChar("palettever",1);
+  }
   propAlerts = prefs.getBool("propalert", true);
   spotAlerts = prefs.getBool("spotalert", true);
   meshAlerts = prefs.getBool("meshalert", true);
@@ -1571,7 +1885,14 @@ void setup() {
   theme = min(static_cast<int>(prefs.getUChar("theme", 2)), 2);
   nightMode = prefs.getBool("night", false);
   autoNight = prefs.getBool("autonight", false);
-  utcOffset = constrain(static_cast<int>(prefs.getChar("utcoffset", 0)), -12, 14);
+  utcMinutes = constrain(prefs.getShort("utcmins", prefs.getChar("utcoffset", 0)*60), -720, 840);
+  zonePreset = min(4, int(prefs.getUChar("zone", 0))); configureZone();
+  checkTimeFormatting();
+  lampMode = min(1, int(prefs.getUChar("lampmode", 0)));
+  gradientSpeed = min(2, int(prefs.getUChar("speed", 1)));
+  spotlightSeconds = min(20, int(prefs.getUChar("spotsec", 8)));
+  quietHours = prefs.getBool("quiet", false);
+  quietStart = min(23, int(prefs.getUChar("qstart",22))); quietEnd = min(23,int(prefs.getUChar("qend",6)));
   idleCycle = prefs.getBool("idlecycle", false);
   normalBacklight = prefs.getUChar("daybl", 255);
   nightBacklight = constrain(static_cast<int>(prefs.getUChar("nightbl", 35)), 5, 150);
@@ -1602,7 +1923,15 @@ void setup() {
 }
 
 void loop() {
+  sampleBattery();
+  serviceDiagnostics();
   web.handleClient();
+  if(millis()-lastBanner>=1000 && !keyboardOpen && !spotlightOpen) {
+    lastBanner=millis(); drawBanner(false);
+    static bool syncReported=false;
+    if(clockSynced && !syncReported) {Serial.println("NTP time synchronized"); syncReported=true;}
+    if(page==0 && !trendExpanded) updateText(260,250,200,20,lastPropSuccess ? String((millis()-lastPropSuccess)/1000)+"s ago"+(millis()-lastPropSuccess>45000?" STALE":" LIVE") : "NO DATA",MUTED);
+  }
   handleTouch();
   finishWifiScan();
   serviceWifiConnection();
@@ -1622,6 +1951,9 @@ void loop() {
     }
   }
   updateLamp();
+  if(page!=4 && !keyboardOpen && !spotlightOpen && millis()-lastInteraction>2000 && time(nullptr)>=1600000000 && WiFi.status()==WL_CONNECTED && static_cast<int32_t>(millis()-nextSpace)>=0) {
+    nextSpace=millis()+600000; pollSpaceWeather(); if(page==3) refreshHealth();
+  }
   if (digitalRead(BOOT) == LOW) {
     if (!bootHold) bootHold = millis();
     else if (!bootLong && millis() - bootHold > 5000 && !apMode) {
