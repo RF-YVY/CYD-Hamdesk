@@ -2,6 +2,15 @@
 
 A touch dashboard for APRS PropView and HamAlert. Configured for the battery-equipped E32R35T (ESP32-WROOM-32E, ST7796 320x480, 4 MB flash, XPT2046 touch). Display and touch are similar to the ESP32-3248S035R/C family, but battery and LED wiring differ. The app retains GT911 detection and resistive-touch calibration support.
 
+### Browser flasher
+
+Open [Ham Desk Web Flasher](https://rf-yvy.github.io/CYD-Hamdesk/) in desktop Chrome or Edge, connect the E32R35T with a USB data cable, and select its CH340 serial device.
+
+- **Update firmware** writes only the application at `0x10000`. Leave **Erase device** unchecked to preserve settings. This option requires the existing Ham Desk E32R35T partition layout.
+- **Erase & install** installs the complete firmware and erases saved settings. Use this for first setup or switching from another firmware.
+
+The browser identifies the ESP32 chip family, not the display-board model. This build targets the E32R35T board with GPIO34 battery sensing and GPIO22 red LED. After installation, configure Wi-Fi and services on the CYD touchscreen; Improv Wi-Fi provisioning is not implemented.
+
 ## Battery and corrected LED wiring
 
 The E32R35T battery connector has a built-in 100k/100k divider connected to GPIO34. The firmware averages 16 calibrated ADC samples every three seconds, multiplies the result by two, and smooths the displayed voltage. The banner displays a battery icon and approximate percentage prefixed by `~`; HEALTH shows voltage and the estimate. Invalid readings display `--` / unavailable. Percentage is a generic single-cell LiPo voltage estimate, affected by load and charging; it is not a fuel-gauge measurement or a charging/USB-detection indicator. A plausible reading cannot reliably detect whether a battery is physically connected.
@@ -23,7 +32,7 @@ Hardware references: [E32R35T pin assignments](https://www.lcdwiki.com/3.5inch_E
 - HEALTH includes NOAA SWPC current radio-blackout (R), solar-radiation (S), and geomagnetic-storm (G) scales with local source timestamp and feed age. It refreshes every ten minutes while a dashboard is open, using verified HTTPS. Reference: [NOAA scales](https://www.swpc.noaa.gov/noaa-scales-explanation), [JSON feed](https://services.swpc.noaa.gov/products/noaa-scales.json).
 - Clock/effect/quiet-hour preferences are also available through the authenticated web setup page. Existing saved connection settings and touch calibration are retained.
 
-This device uses the CH340 USB serial port **COM13**: `pio run -e cyd35 -t upload --upload-port COM13`.
+This device uses the CH340 USB serial port **COM13** ***Your COM port will likely be different***: `pio run -e cyd35 -t upload --upload-port COM13`.
 
 ## What it does
 
